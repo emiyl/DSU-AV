@@ -1,5 +1,7 @@
 #include <dsu/dsu_server.h>
 #include <av/av_codecs.h>
+#include "../app/platform.h"
+#include "../app/sdl_display.h"
 
 #include <SDL.h>
 
@@ -21,21 +23,23 @@
 typedef struct {
     AvCodecs *codecs;
     DsuAvSessionSettings settings;
-    SDL_Window *video_window;
-    SDL_Renderer *video_renderer;
-    SDL_Texture *video_texture;
+    SdlDisplay *display;
     SDL_AudioDeviceID audio_device;
     int16_t pcm[MAX_OPUS_SAMPLES * 2];
     bool active;
 } DesktopAv;
 
-static uint64_t monotonic_us(void)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (uint64_t)now.tv_sec * 1000000ULL +
-        (uint64_t)now.tv_nsec / 1000ULL;
-}
+struct AppPlatform {
+    SdlDisplay *display;
+    SDL_GameController *controller;
+    DesktopAv av;
+    DsuAvCapabilities av_capabilities;
+    DsuAvCallbacks av_callbacks;
+    DsuServerConfig config;
+    char ip_address[INET_ADDRSTRLEN];
+    bool running;
+    uint64_t next_title_update_us;
+};
 
 static bool find_local_ipv4(char *output, size_t output_size)
 {
@@ -163,48 +167,6 @@ static void update_controller_state(DsuControllerState *state,
         state->button_masks[1] |= 0x01;
 }
 
-static void render_controller(SDL_Renderer *renderer,
-    const DsuControllerState *state)
-{
-    SDL_SetRenderDrawColor(renderer, 24, 27, 32, 255);
-    SDL_RenderClear(renderer);
-
-    const int stick_y = WINDOW_HEIGHT / 2;
-    const int stick_centers[2] = {150, 340};
-    for (unsigned i = 0; i < 2; ++i) {
-        SDL_SetRenderDrawColor(renderer, 72, 78, 90, 255);
-        SDL_Rect area = {stick_centers[i] - 55, stick_y - 55, 110, 110};
-        SDL_RenderDrawRect(renderer, &area);
-    }
-
-    int left_x = stick_centers[0] +
-        ((int)state->left_stick_x - 128) * 45 / 128;
-    int left_y = stick_y -
-        ((int)state->left_stick_y - 128) * 45 / 128;
-    int right_x = stick_centers[1] +
-        ((int)state->right_stick_x - 128) * 45 / 128;
-    int right_y = stick_y -
-        ((int)state->right_stick_y - 128) * 45 / 128;
-    SDL_SetRenderDrawColor(renderer, state->connected ? 70 : 160,
-        state->connected ? 190 : 70, 100, 255);
-    SDL_Rect left = {left_x - 10, left_y - 10, 20, 20};
-    SDL_Rect right = {right_x - 10, right_y - 10, 20, 20};
-    SDL_RenderFillRect(renderer, &left);
-    SDL_RenderFillRect(renderer, &right);
-
-    const int button_x[4] = {545, 580, 615, 580};
-    const int button_y[4] = {120, 85, 120, 155};
-    const uint8_t analog_indexes[4] = {7, 6, 5, 4};
-    for (unsigned i = 0; i < 4; ++i) {
-        bool pressed = state->analog_buttons[analog_indexes[i]] != 0;
-        SDL_SetRenderDrawColor(renderer, pressed ? 255 : 100,
-            pressed ? 210 : 105, pressed ? 60 : 115, 255);
-        SDL_Rect button = {button_x[i] - 14, button_y[i] - 14, 28, 28};
-        SDL_RenderFillRect(renderer, &button);
-    }
-    SDL_RenderPresent(renderer);
-}
-
 static bool av_session_start(void *context,
     const DsuAvSessionSettings *settings)
 {
@@ -240,26 +202,10 @@ static bool av_session_start(void *context,
     return true;
 }
 
-static void close_video_window(DesktopAv *av)
-{
-    if (av->video_texture) {
-        SDL_DestroyTexture(av->video_texture);
-        av->video_texture = NULL;
-    }
-    if (av->video_renderer) {
-        SDL_DestroyRenderer(av->video_renderer);
-        av->video_renderer = NULL;
-    }
-    if (av->video_window) {
-        SDL_DestroyWindow(av->video_window);
-        av->video_window = NULL;
-    }
-}
-
 static void av_session_stop(void *context)
 {
     DesktopAv *av = context;
-    close_video_window(av);
+    sdl_display_clear_video(av->display);
     if (av->audio_device) {
         SDL_CloseAudioDevice(av->audio_device);
         av->audio_device = 0;
@@ -273,37 +219,7 @@ static void video_frame_callback(void *context,
     const AvDecodedFrame *frame)
 {
     DesktopAv *av = context;
-    if (!av->video_window) {
-        av->video_window = SDL_CreateWindow("DSU-AV Video",
-            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-            frame->width, frame->height, SDL_WINDOW_RESIZABLE | SDL_WINDOW_SHOWN);
-        if (av->video_window)
-            av->video_renderer = SDL_CreateRenderer(av->video_window, -1,
-                SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-        if (!av->video_renderer && av->video_window)
-            av->video_renderer =
-                SDL_CreateRenderer(av->video_window, -1, SDL_RENDERER_SOFTWARE);
-        if (av->video_renderer)
-            av->video_texture = SDL_CreateTexture(av->video_renderer,
-                SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
-                frame->width, frame->height);
-        if (!av->video_texture) {
-            close_video_window(av);
-            return;
-        }
-    }
-
-    uint8_t *pixels = NULL;
-    int pitch = 0;
-    if (SDL_LockTexture(av->video_texture, NULL, (void **)&pixels, &pitch) < 0)
-        return;
-    if (!av_codecs_scale_to_rgba(av->codecs, frame, pixels, pitch,
-            frame->width, frame->height))
-        memset(pixels, 0, (size_t)pitch * frame->height);
-    SDL_UnlockTexture(av->video_texture);
-    SDL_RenderClear(av->video_renderer);
-    SDL_RenderCopy(av->video_renderer, av->video_texture, NULL, NULL);
-    SDL_RenderPresent(av->video_renderer);
+    sdl_display_frame(av->display, av->codecs, frame);
 }
 
 static void av_video_frame(void *context, uint64_t timestamp_us,
@@ -341,56 +257,38 @@ static void av_poll(DesktopAv *av)
         av_codecs_poll_video(av->codecs, video_frame_callback, av);
 }
 
-int main(int argc, char **argv)
+AppPlatform *app_platform_create(void)
 {
-    (void)argc;
-    (void)argv;
+    AppPlatform *platform = calloc(1, sizeof(*platform));
+    if (!platform)
+        return NULL;
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO |
             SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) < 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
-        return 1;
+        free(platform);
+        return NULL;
     }
 
-    SDL_Window *window = SDL_CreateWindow("DSU Desktop Controller",
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_SHOWN);
-    if (!window) {
-        SDL_Log("SDL window creation failed: %s", SDL_GetError());
+    platform->display = sdl_display_create();
+    if (!platform->display) {
         SDL_Quit();
-        return 1;
+        free(platform);
+        return NULL;
     }
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!renderer)
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    if (!renderer) {
-        SDL_Log("SDL renderer creation failed: %s", SDL_GetError());
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
+    platform->av.display = platform->display;
 
-    char address[INET_ADDRSTRLEN] = "127.0.0.1";
-    find_local_ipv4(address, sizeof(address));
+    strcpy(platform->ip_address, "127.0.0.1");
+    find_local_ipv4(platform->ip_address, sizeof(platform->ip_address));
     uint32_t server_id = (uint32_t)(SDL_GetPerformanceCounter() ^
         (uint64_t)time(NULL));
-    DsuServerConfig config = {
+    platform->config = (DsuServerConfig){
         .server_id = server_id,
         .controller_mac = {
             0x02, 0x44, 0x53, (uint8_t)(server_id >> 16),
             (uint8_t)(server_id >> 8), (uint8_t)server_id,
         },
     };
-    DsuServer server = {0};
-    if (!dsu_server_init(&server, &config)) {
-        SDL_Log("Could not bind DSU UDP port %d", DSU_PORT);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        return 1;
-    }
-    DesktopAv av = {0};
-    DsuAvCapabilities av_capabilities = {
+    platform->av_capabilities = (DsuAvCapabilities){
         .flags = DSU_AV_CAP_VIDEO | DSU_AV_CAP_AUDIO |
             DSU_AV_CAP_KEYFRAME | DSU_AV_CAP_QUALITY,
         .video_codec = DSU_AV_CODEC_H264,
@@ -404,72 +302,133 @@ int main(int argc, char **argv)
         .audio_frame_duration_01ms = 100,
         .payload_limit = 1100,
     };
-    DsuAvCallbacks av_callbacks = {
+    platform->av_callbacks = (DsuAvCallbacks){
         .session_start = av_session_start,
         .session_stop = av_session_stop,
         .video_frame = av_video_frame,
         .audio_packet = av_audio_packet,
     };
-    dsu_server_configure_av(&server, &av_capabilities, &av_callbacks, &av);
-    SDL_Log("DSU server listening on %s:%d", address, DSU_PORT);
-
-    SDL_GameController *controller = open_controller();
+    platform->controller = open_controller();
     SDL_Log("Controller: %s",
-        controller ? SDL_GameControllerName(controller) :
+        platform->controller ? SDL_GameControllerName(platform->controller) :
             "waiting for an SDL-mapped gamepad");
-    DsuControllerState state = {0};
-    bool running = true;
-    uint64_t next_title_update = 0;
+    platform->running = true;
+    return platform;
+}
 
-    while (running) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT)
-                running = false;
-            else if (event.type == SDL_WINDOWEVENT &&
-                event.window.event == SDL_WINDOWEVENT_CLOSE &&
-                av.video_window &&
-                event.window.windowID == SDL_GetWindowID(av.video_window))
-                close_video_window(&av);
-            else if (event.type == SDL_CONTROLLERDEVICEADDED && !controller)
-                controller = SDL_GameControllerOpen(event.cdevice.which);
-            else if (event.type == SDL_CONTROLLERDEVICEREMOVED &&
-                controller && event.cdevice.which ==
-                    SDL_JoystickInstanceID(
-                        SDL_GameControllerGetJoystick(controller))) {
-                SDL_GameControllerClose(controller);
-                controller = NULL;
-            }
-        }
-
-        SDL_GameControllerUpdate();
-        update_controller_state(&state, controller);
-        dsu_server_poll(&server, &state);
-        av_poll(&av);
-        dsu_server_broadcast(&server, &state);
-        dsu_server_expire_clients(&server);
-        render_controller(renderer, &state);
-
-        uint64_t now = monotonic_us();
-        if (now >= next_title_update) {
-            char title[160];
-            snprintf(title, sizeof(title),
-                "DSU Desktop Controller - %s:%d - %s - %u client(s)",
-                address, DSU_PORT,
-                controller ? SDL_GameControllerName(controller) :
-                    "virtual controller (neutral)", server.subscriptions);
-            SDL_SetWindowTitle(window, title);
-            next_title_update = now + 1000000;
-        }
-        SDL_Delay(POLL_INTERVAL_MS);
-    }
-
-    if (controller)
-        SDL_GameControllerClose(controller);
-    av_session_stop(&av);
-    dsu_server_close(&server);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+void app_platform_destroy(AppPlatform *platform)
+{
+    if (!platform)
+        return;
+    if (platform->controller)
+        SDL_GameControllerClose(platform->controller);
+    av_session_stop(&platform->av);
+    sdl_display_destroy(platform->display);
     SDL_Quit();
-    return 0;
+    free(platform);
+}
+
+bool app_platform_running(AppPlatform *platform)
+{
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+        if (event.type == SDL_QUIT)
+            platform->running = false;
+        else if (event.type == SDL_CONTROLLERDEVICEADDED &&
+            !platform->controller)
+            platform->controller =
+                SDL_GameControllerOpen(event.cdevice.which);
+        else if (event.type == SDL_CONTROLLERDEVICEREMOVED &&
+            platform->controller &&
+            event.cdevice.which ==
+                SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(
+                    platform->controller))) {
+            SDL_GameControllerClose(platform->controller);
+            platform->controller = NULL;
+        }
+    }
+    if (!sdl_display_process_events(platform->display))
+        platform->running = false;
+    return platform->running;
+}
+
+bool app_platform_start_network(AppPlatform *platform)
+{
+    return platform != NULL;
+}
+
+void app_platform_stop_network(AppPlatform *platform)
+{
+    (void)platform;
+}
+
+bool app_platform_attach_server(AppPlatform *platform, DsuServer *server)
+{
+    (void)platform;
+    (void)server;
+    return true;
+}
+
+bool app_platform_server_config(AppPlatform *platform,
+    DsuServerConfig *config)
+{
+    if (!platform || !config)
+        return false;
+    *config = platform->config;
+    return true;
+}
+
+const char *app_platform_ip_address(const AppPlatform *platform)
+{
+    return platform->ip_address;
+}
+
+const char *app_platform_name(const AppPlatform *platform)
+{
+    (void)platform;
+    return "Desktop SDL";
+}
+
+void app_platform_update_controller(AppPlatform *platform,
+    DsuControllerState *controller)
+{
+    SDL_GameControllerUpdate();
+    update_controller_state(controller, platform->controller);
+}
+
+const DsuAvCapabilities *app_platform_av_capabilities(
+    const AppPlatform *platform)
+{
+    return &platform->av_capabilities;
+}
+
+const DsuAvCallbacks *app_platform_av_callbacks(const AppPlatform *platform)
+{
+    return &platform->av_callbacks;
+}
+
+void *app_platform_av_context(AppPlatform *platform)
+{
+    return &platform->av;
+}
+
+void app_platform_poll_media(AppPlatform *platform)
+{
+    av_poll(&platform->av);
+}
+
+void app_platform_render_status(AppPlatform *platform, const DsuServer *server,
+    const DsuControllerState *controller)
+{
+    sdl_display_status(platform->display, server, controller, "Desktop SDL",
+        platform->ip_address,
+        ((uint64_t)controller->button_masks[0] << 8) |
+            controller->button_masks[1],
+        "NOT AVAILABLE");
+}
+
+void app_platform_sleep(AppPlatform *platform)
+{
+    (void)platform;
+    SDL_Delay(POLL_INTERVAL_MS);
 }

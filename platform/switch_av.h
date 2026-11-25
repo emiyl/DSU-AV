@@ -2,10 +2,11 @@
 
 #include <stdbool.h>
 #include <dsu/dsu_server.h>
+#include "../app/sdl_display.h"
 
 typedef struct SwitchAv SwitchAv;
 
-SwitchAv *switch_av_create(DsuServer *server);
+SwitchAv *switch_av_create(DsuServer *server, SdlDisplay *display);
 void switch_av_destroy(SwitchAv *media);
 const DsuAvCapabilities *switch_av_capabilities(const SwitchAv *media);
 const DsuAvCallbacks *switch_av_callbacks(const SwitchAv *media);

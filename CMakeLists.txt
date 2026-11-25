@@ -32,32 +32,35 @@ target_link_libraries(av_codecs
 if(NOT NINTENDO_SWITCH)
     find_package(SDL2 REQUIRED CONFIG)
 
-    add_executable(dsu-desktop
-        desktop/main.c
+    add_executable(dsu-controller
+        app/main.c
+        app/sdl_display.c
+        platform/desktop.c
     )
-    target_link_libraries(dsu-desktop
+    target_link_libraries(dsu-controller
         PRIVATE
-            dsu::server
             av::codecs
             SDL2::SDL2
             SDL2::SDL2main
     )
-    target_compile_options(dsu-desktop PRIVATE -Wall -Wextra -Werror)
-    target_compile_features(dsu-desktop PRIVATE c_std_11)
+    target_compile_options(dsu-controller PRIVATE -Wall -Wextra -Werror)
+    target_compile_features(dsu-controller PRIVATE c_std_11)
     return()
 endif()
 
 if(NINTENDO_SWITCH2)
-    set(DSU_SWITCH_TARGET "dsu-switch2")
+    set(DSU_SWITCH_TARGET "dsu-controller-switch2")
     set(DSU_SWITCH_PLATFORM_NAME "Nintendo Switch 2")
 else()
-    set(DSU_SWITCH_TARGET "dsu-switch1")
+    set(DSU_SWITCH_TARGET "dsu-controller-switch1")
     set(DSU_SWITCH_PLATFORM_NAME "Nintendo Switch")
 endif()
 
 add_executable(${DSU_SWITCH_TARGET}
-    source/main.c
-    source/switch_av.c
+    app/main.c
+    app/sdl_display.c
+    platform/switch.c
+    platform/switch_av.c
 )
 
 target_compile_definitions(${DSU_SWITCH_TARGET} PRIVATE
@@ -71,7 +74,6 @@ target_include_directories(${DSU_SWITCH_TARGET}
 )
 target_link_libraries(${DSU_SWITCH_TARGET}
     PRIVATE
-        dsu::server
         av::codecs
         nx
         SDL2

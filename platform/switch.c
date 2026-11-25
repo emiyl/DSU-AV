@@ -1,10 +1,13 @@
 #include <dsu/dsu_server.h>
 #include "switch_av.h"
+#include "../app/platform.h"
+#include "../app/sdl_display.h"
 
 #include <arpa/inet.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -15,6 +18,20 @@
 #define UI_REFRESH_NS 250000000ULL
 #define SEND_INTERVAL_NS 10000000ULL
 #define EXIT_HOLD_US 3000000ULL
+
+struct AppPlatform {
+    SdlDisplay *display;
+    PadState pad;
+    HidSixAxisSensorHandle motion_handles[MOTION_HANDLES];
+    char ip_address[INET_ADDRSTRLEN];
+    DsuServerConfig config;
+    SwitchAv *media;
+    bool socket_initialized;
+    bool nifm_initialized;
+    uint64_t frame;
+    uint64_t controller_buttons;
+    uint64_t exit_hold_started_us;
+};
 
 static uint8_t axis_to_dsu(int32_t axis)
 {
@@ -129,126 +146,162 @@ static void update_controller_state(DsuControllerState *state, const PadState *p
     }
 }
 
-static void print_status(const char *ip_address, const DsuServer *server,
-    const DsuControllerState *controller, const SwitchAv *media,
-    uint64_t buttons)
+AppPlatform *app_platform_create(void)
 {
-    printf("\x1b[1;1H");
-    printf("DSU Controller Server\n");
-    printf("Platform : %s\n", DSU_SWITCH_PLATFORM_NAME);
-    printf("Listen   : %s:%u (UDP)\n", ip_address, (unsigned)DSU_PORT);
-    printf("Client   : %s\n",
-        server->subscriptions > 0 ? server->last_client : "waiting for subscription");
-    printf("Inputs   : %s\n", controller->connected ? "controller connected" :
-        "controller disconnected");
-    printf("DSU-AV   : %s%s\n", dsu_server_av_is_active(server) ?
-        "session active" : "ready",
-        switch_av_is_video_visible(media) ? " (video)" : "");
-    printf("Sent     : %" PRIu32 " packets\n", server->packets_sent);
-    printf("Buttons  : 0x%016" PRIx64 "\n", buttons);
-    printf("L stick  : %3u, %3u\n", controller->left_stick_x,
-        controller->left_stick_y);
-    printf("R stick  : %3u, %3u\n", controller->right_stick_x,
-        controller->right_stick_y);
-    printf("\nPress A to enable/mute the microphone when requested.\n");
-    printf("Hold PLUS + MINUS for 3 seconds to exit.\n");
+    AppPlatform *platform = calloc(1, sizeof(*platform));
+    if (!platform)
+        return NULL;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        free(platform);
+        return NULL;
+    }
+    platform->display = sdl_display_create();
+    if (!platform->display) {
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        free(platform);
+        return NULL;
+    }
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&platform->pad);
+    initialize_motion(platform->motion_handles);
+    strcpy(platform->ip_address, "No network");
+    return platform;
 }
 
-int main(void)
+void app_platform_destroy(AppPlatform *platform)
 {
-    consoleInit(NULL);
-    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-    PadState pad;
-    padInitializeDefault(&pad);
+    if (!platform)
+        return;
+    switch_av_destroy(platform->media);
+    sdl_display_destroy(platform->display);
+    for (unsigned i = 0; i < MOTION_HANDLES; ++i) {
+        if (platform->motion_handles[i].type_value != 0)
+            hidStopSixAxisSensor(platform->motion_handles[i]);
+    }
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    free(platform);
+}
 
-    HidSixAxisSensorHandle motion_handles[MOTION_HANDLES] = {0};
-    initialize_motion(motion_handles);
-
-    char ip_address[INET_ADDRSTRLEN] = "No network";
+bool app_platform_start_network(AppPlatform *platform)
+{
     Result nifm_result = nifmInitialize(NifmServiceType_User);
-    if (R_SUCCEEDED(nifm_result)) {
+    platform->nifm_initialized = R_SUCCEEDED(nifm_result);
+    if (platform->nifm_initialized) {
         uint32_t current_ip = 0;
         if (R_SUCCEEDED(nifmGetCurrentIpAddress(&current_ip))) {
             struct in_addr address = {.s_addr = current_ip};
-            inet_ntop(AF_INET, &address, ip_address, sizeof(ip_address));
+            inet_ntop(AF_INET, &address, platform->ip_address,
+                sizeof(platform->ip_address));
         }
     }
+    platform->socket_initialized =
+        R_SUCCEEDED(socketInitializeDefault());
+    return platform->socket_initialized;
+}
 
-    DsuServer server = {0};
-    Result socket_result = socketInitializeDefault();
+void app_platform_stop_network(AppPlatform *platform)
+{
+    if (platform->socket_initialized)
+        socketExit();
+    if (platform->nifm_initialized)
+        nifmExit();
+}
+
+bool app_platform_server_config(AppPlatform *platform,
+    DsuServerConfig *config)
+{
     uint32_t server_id = (uint32_t)svcGetSystemTick();
-    DsuServerConfig server_config = {
+    platform->config = (DsuServerConfig){
         .server_id = server_id,
         .controller_mac = {
             0x02, 0x00, 0x44, (uint8_t)(server_id >> 16),
             (uint8_t)(server_id >> 8), (uint8_t)server_id,
         },
     };
-    bool server_ready = R_SUCCEEDED(socket_result) &&
-        dsu_server_init(&server, &server_config);
-    SwitchAv *media = server_ready ? switch_av_create(&server) : NULL;
-    if (media) {
-        dsu_server_configure_av(&server, switch_av_capabilities(media),
-            switch_av_callbacks(media), media);
-    }
-    uint64_t frame = 0;
-    uint64_t exit_hold_started_us = 0;
-    uint64_t controller_buttons = 0;
-    DsuControllerState controller = {0};
+    *config = platform->config;
+    return true;
+}
 
-    if (!server_ready) {
-        printf("DSU server could not start.\n");
-        printf("NIFM result: 0x%08x\n", nifm_result);
-        printf("Socket result: 0x%08x\n", socket_result);
-        printf("Check the network connection.\n");
-        printf("Hold PLUS + MINUS for 3 seconds to exit.\n");
-    }
+bool app_platform_attach_server(AppPlatform *platform, DsuServer *server)
+{
+    platform->media = switch_av_create(server, platform->display);
+    return platform->media != NULL;
+}
 
-    while (appletMainLoop()) {
-        padUpdate(&pad);
-        uint64_t buttons = padGetButtons(&pad);
-        uint64_t buttons_down = padGetButtonsDown(&pad);
-        uint64_t now_us = clock_us();
-        bool exit_buttons_held =
-            (buttons & (HidNpadButton_Plus | HidNpadButton_Minus)) ==
-            (HidNpadButton_Plus | HidNpadButton_Minus);
-        if (!exit_buttons_held)
-            exit_hold_started_us = 0;
-        else if (exit_hold_started_us == 0)
-            exit_hold_started_us = now_us;
-        else if (now_us - exit_hold_started_us >= EXIT_HOLD_US)
-            break;
+bool app_platform_running(AppPlatform *platform)
+{
+    if (!appletMainLoop())
+        return false;
+    if (!sdl_display_process_events(platform->display))
+        return false;
+    padUpdate(&platform->pad);
+    uint64_t buttons = padGetButtons(&platform->pad);
+    uint64_t now_us = clock_us();
+    bool exit_buttons_held =
+        (buttons & (HidNpadButton_Plus | HidNpadButton_Minus)) ==
+        (HidNpadButton_Plus | HidNpadButton_Minus);
+    if (!exit_buttons_held)
+        platform->exit_hold_started_us = 0;
+    else if (platform->exit_hold_started_us == 0)
+        platform->exit_hold_started_us = now_us;
+    else if (now_us - platform->exit_hold_started_us >= EXIT_HOLD_US)
+        return false;
+    return true;
+}
 
-        switch_av_handle_input(media, buttons_down);
-        update_controller_state(&controller, &pad, motion_handles,
-            &controller_buttons);
-        if (server_ready) {
-            dsu_server_poll(&server, &controller);
-            switch_av_poll(media);
-            dsu_server_broadcast(&server, &controller);
-            dsu_server_expire_clients(&server);
-        }
+const char *app_platform_ip_address(const AppPlatform *platform)
+{
+    return platform->ip_address;
+}
 
-        if ((frame++ % 25) == 0 && server_ready &&
-            !switch_av_is_video_visible(media))
-            print_status(ip_address, &server, &controller, media,
-                controller_buttons);
+const char *app_platform_name(const AppPlatform *platform)
+{
+    (void)platform;
+    return DSU_SWITCH_PLATFORM_NAME;
+}
 
-        if (!switch_av_is_video_visible(media))
-            consoleUpdate(NULL);
-        svcSleepThread(SEND_INTERVAL_NS);
-    }
+void app_platform_update_controller(AppPlatform *platform,
+    DsuControllerState *controller)
+{
+    uint64_t buttons_down = padGetButtonsDown(&platform->pad);
+    switch_av_handle_input(platform->media, buttons_down);
+    update_controller_state(controller, &platform->pad,
+        platform->motion_handles, &platform->controller_buttons);
+}
 
-    dsu_server_close(&server);
-    switch_av_destroy(media);
-    if (R_SUCCEEDED(socket_result))
-        socketExit();
-    if (R_SUCCEEDED(nifm_result))
-        nifmExit();
-    for (unsigned i = 0; i < MOTION_HANDLES; ++i) {
-        if (motion_handles[i].type_value != 0)
-            hidStopSixAxisSensor(motion_handles[i]);
-    }
-    consoleExit(NULL);
-    return 0;
+const DsuAvCapabilities *app_platform_av_capabilities(
+    const AppPlatform *platform)
+{
+    return switch_av_capabilities(platform->media);
+}
+
+const DsuAvCallbacks *app_platform_av_callbacks(const AppPlatform *platform)
+{
+    return switch_av_callbacks(platform->media);
+}
+
+void *app_platform_av_context(AppPlatform *platform)
+{
+    return platform->media;
+}
+
+void app_platform_poll_media(AppPlatform *platform)
+{
+    switch_av_poll(platform->media);
+}
+
+void app_platform_render_status(AppPlatform *platform, const DsuServer *server,
+    const DsuControllerState *controller)
+{
+    (void)platform->frame++;
+    sdl_display_status(platform->display, server, controller,
+        DSU_SWITCH_PLATFORM_NAME, platform->ip_address,
+        platform->controller_buttons,
+        "HOLD A TO ENABLE OR MUTE");
+}
+
+void app_platform_sleep(AppPlatform *platform)
+{
+    (void)platform;
+    svcSleepThread(SEND_INTERVAL_NS);
 }

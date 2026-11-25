@@ -26,8 +26,7 @@ struct SwitchAv {
     DsuAvCallbacks callbacks;
     DsuAvSessionSettings settings;
     bool active;
-    bool framebuffer_active;
-    bool console_visible;
+    SdlDisplay *display;
     bool microphone_enabled;
     bool microphone_requested;
     uint8_t microphone_state;
@@ -38,8 +37,6 @@ struct SwitchAv {
     uint8_t opus_output[1500];
     int16_t opus_pcm[MAX_OPUS_SAMPLES * 2];
 
-    Framebuffer framebuffer;
-
 #ifdef __SWITCH2__
     VideoDecoder decoder;
     bool decoder_created;
@@ -48,66 +45,9 @@ struct SwitchAv {
 #endif
 };
 
-static void restore_console(SwitchAv *media)
-{
-    if (media->framebuffer_active) {
-        framebufferClose(&media->framebuffer);
-        media->framebuffer_active = false;
-    }
-    if (!media->console_visible) {
-        consoleInit(NULL);
-        media->console_visible = true;
-    }
-}
-
-static bool prepare_framebuffer(SwitchAv *media)
-{
-    if (media->framebuffer_active)
-        return true;
-    if (media->console_visible) {
-        consoleExit(NULL);
-        media->console_visible = false;
-    }
-    Result rc = framebufferCreate(&media->framebuffer, nwindowGetDefault(),
-        DISPLAY_WIDTH, DISPLAY_HEIGHT, PIXEL_FORMAT_RGBA_8888, 2);
-    if (R_FAILED(rc))
-        goto fail;
-    if (R_FAILED(framebufferMakeLinear(&media->framebuffer))) {
-        framebufferClose(&media->framebuffer);
-        goto fail;
-    }
-    media->framebuffer_active = true;
-    return true;
-
-fail:
-    consoleInit(NULL);
-    media->console_visible = true;
-    return false;
-}
-
 static void render_frame(SwitchAv *media, const AvDecodedFrame *frame)
 {
-    if (!media->framebuffer_active || !frame)
-        return;
-
-    uint32_t stride = 0;
-    uint8_t *destination = framebufferBegin(&media->framebuffer, &stride);
-    if (!destination)
-        return;
-    if (!av_codecs_scale_to_rgba(media->codecs, frame, destination,
-            (int)stride, DISPLAY_WIDTH, DISPLAY_HEIGHT))
-        goto present;
-    if (media->microphone_enabled) {
-        const uint32_t indicator = RGBA8(255, 48, 48, 255);
-        for (int y = 8; y < 20; ++y) {
-            uint32_t *row =
-                (uint32_t *)(destination + (size_t)y * stride);
-            for (int x = DISPLAY_WIDTH - 20; x < DISPLAY_WIDTH - 8; ++x)
-                row[x] = indicator;
-        }
-    }
-present:
-    framebufferEnd(&media->framebuffer);
+    sdl_display_frame(media->display, media->codecs, frame);
 }
 
 #ifndef __SWITCH2__
@@ -201,6 +141,7 @@ static void audio_packet(void *context, uint32_t sequence,
 
 static void close_media_session(SwitchAv *media)
 {
+    sdl_display_clear_video(media->display);
     if (media->capture_device) {
         SDL_PauseAudioDevice(media->capture_device, 1);
         SDL_CloseAudioDevice(media->capture_device);
@@ -222,7 +163,6 @@ static void close_media_session(SwitchAv *media)
     media->microphone_enabled = false;
     media->microphone_requested = false;
     media->microphone_state = 0;
-    restore_console(media);
 }
 
 static bool session_start(void *context, const DsuAvSessionSettings *settings)
@@ -233,11 +173,6 @@ static bool session_start(void *context, const DsuAvSessionSettings *settings)
     media->codecs = av_codecs_create(settings);
     if (!media->codecs)
         goto fail;
-
-    if (settings->video_codec != DSU_AV_CODEC_NONE) {
-        if (!prepare_framebuffer(media))
-            goto fail;
-    }
 
     if (settings->audio_codec != DSU_AV_CODEC_NONE) {
         SDL_AudioSpec desired = {
@@ -375,16 +310,16 @@ const DsuAvCallbacks *switch_av_callbacks(const SwitchAv *media)
 
 bool switch_av_is_video_visible(const SwitchAv *media)
 {
-    return media && media->framebuffer_active;
+    return media && sdl_display_has_video(media->display);
 }
 
-SwitchAv *switch_av_create(DsuServer *server)
+SwitchAv *switch_av_create(DsuServer *server, SdlDisplay *display)
 {
     SwitchAv *media = calloc(1, sizeof(*media));
     if (!media)
         return NULL;
     media->server = server;
-    media->console_visible = true;
+    media->display = display;
     media->capabilities = (DsuAvCapabilities) {
         .flags = DSU_AV_CAP_VIDEO | DSU_AV_CAP_AUDIO |
             DSU_AV_CAP_KEYFRAME | DSU_AV_CAP_QUALITY |
