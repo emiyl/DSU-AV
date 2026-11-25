@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include <libavcodec/avcodec.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 #include <opus.h>
 
@@ -17,10 +18,15 @@ struct AvCodecs {
     const AVCodec *h264_codec;
     AVPacket *h264_packet;
     AVFrame *decoded_frame;
+    AVCodecContext *h264_encoder_context;
+    AVPacket *h264_encoder_packet;
+    AVFrame *h264_encoder_frame;
 #endif
     OpusDecoder *opus_decoder;
-    OpusEncoder *opus_encoder;
+    OpusEncoder *opus_audio_encoder;
+    OpusEncoder *opus_microphone_encoder;
     struct SwsContext *scaler;
+    struct SwsContext *encoder_scaler;
     enum AVPixelFormat scaler_format;
     int scaler_width;
     int scaler_height;
@@ -31,6 +37,10 @@ struct AvCodecs {
     uint32_t microphone_frame_bytes;
     int microphone_frame_samples;
     int microphone_channels;
+    int video_width;
+    int video_height;
+    int video_fps;
+    int video_bitrate_kbps;
 };
 
 AvCodecs *av_codecs_create(const DsuAvSessionSettings *settings)
@@ -62,16 +72,22 @@ AvCodecs *av_codecs_create(const DsuAvSessionSettings *settings)
             settings->audio_channels, &error);
         if (error != OPUS_OK)
             goto fail;
+        codecs->opus_audio_encoder = opus_encoder_create(
+            settings->audio_sample_rate_div100 * 100,
+            settings->audio_channels, OPUS_APPLICATION_AUDIO, &error);
+        if (error != OPUS_OK)
+            goto fail;
     }
 
     if (settings->microphone_codec == DSU_AV_CODEC_OPUS) {
         int error = OPUS_OK;
-        codecs->opus_encoder = opus_encoder_create(
+        codecs->opus_microphone_encoder = opus_encoder_create(
             settings->microphone_sample_rate_div100 * 100,
             settings->microphone_channels, OPUS_APPLICATION_VOIP, &error);
         if (error != OPUS_OK)
             goto fail;
-        opus_encoder_ctl(codecs->opus_encoder, OPUS_SET_BITRATE(24000));
+        opus_encoder_ctl(codecs->opus_microphone_encoder,
+            OPUS_SET_BITRATE(24000));
         codecs->microphone_frame_samples =
             settings->microphone_frame_duration_01ms *
             (settings->microphone_sample_rate_div100 * 100) / 10000;
@@ -80,6 +96,10 @@ AvCodecs *av_codecs_create(const DsuAvSessionSettings *settings)
             (uint32_t)codecs->microphone_frame_samples *
             codecs->microphone_channels * sizeof(int16_t);
     }
+    codecs->video_width = settings->video_width;
+    codecs->video_height = settings->video_height;
+    codecs->video_fps = settings->video_fps;
+    codecs->video_bitrate_kbps = settings->video_bitrate_kbps;
     return codecs;
 
 fail:
@@ -93,11 +113,18 @@ void av_codecs_destroy(AvCodecs *codecs)
         return;
     if (codecs->scaler)
         sws_freeContext(codecs->scaler);
+    if (codecs->encoder_scaler)
+        sws_freeContext(codecs->encoder_scaler);
     if (codecs->opus_decoder)
         opus_decoder_destroy(codecs->opus_decoder);
-    if (codecs->opus_encoder)
-        opus_encoder_destroy(codecs->opus_encoder);
+    if (codecs->opus_audio_encoder)
+        opus_encoder_destroy(codecs->opus_audio_encoder);
+    if (codecs->opus_microphone_encoder)
+        opus_encoder_destroy(codecs->opus_microphone_encoder);
 #ifdef AV_CODECS_SOFTWARE_H264
+    av_packet_free(&codecs->h264_encoder_packet);
+    av_frame_free(&codecs->h264_encoder_frame);
+    avcodec_free_context(&codecs->h264_encoder_context);
     av_packet_free(&codecs->h264_packet);
     av_frame_free(&codecs->decoded_frame);
     avcodec_free_context(&codecs->h264_context);
@@ -205,6 +232,119 @@ bool av_codecs_extract_h264_config(const uint8_t *data, uint32_t length,
     return found_sps && found_pps;
 }
 
+#ifdef AV_CODECS_SOFTWARE_H264
+static bool av_codecs_init_h264_encoder(AvCodecs *codecs)
+{
+    if (codecs->h264_encoder_context)
+        return true;
+    const AVCodec *codec = avcodec_find_encoder_by_name("libx264");
+    if (!codec)
+        codec = avcodec_find_encoder(AV_CODEC_ID_H264);
+    if (!codec)
+        return false;
+
+    AVCodecContext *context = avcodec_alloc_context3(codec);
+    AVPacket *packet = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    if (!context || !packet || !frame)
+        goto fail;
+    context->width = codecs->video_width;
+    context->height = codecs->video_height;
+    context->pix_fmt = AV_PIX_FMT_YUV420P;
+    context->time_base = (AVRational){1, codecs->video_fps};
+    context->framerate = (AVRational){codecs->video_fps, 1};
+    context->bit_rate = (int64_t)codecs->video_bitrate_kbps * 1000;
+    context->gop_size = codecs->video_fps * 2;
+    context->max_b_frames = 0;
+    context->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    context->thread_count = 1;
+    av_opt_set(context->priv_data, "preset", "ultrafast", 0);
+    av_opt_set(context->priv_data, "tune", "zerolatency", 0);
+    if (avcodec_open2(context, codec, NULL) < 0)
+        goto fail;
+
+    frame->format = context->pix_fmt;
+    frame->width = context->width;
+    frame->height = context->height;
+    if (av_frame_get_buffer(frame, 32) < 0)
+        goto fail;
+
+    codecs->h264_encoder_context = context;
+    codecs->h264_encoder_packet = packet;
+    codecs->h264_encoder_frame = frame;
+    return true;
+
+fail:
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+    avcodec_free_context(&context);
+    return false;
+}
+#endif
+
+int av_codecs_encode_rgba(AvCodecs *codecs, const uint8_t *rgba, int stride,
+    uint64_t timestamp_us, bool force_keyframe, bool *is_keyframe,
+    uint8_t *data, int capacity)
+{
+#ifndef AV_CODECS_SOFTWARE_H264
+    (void)codecs;
+    (void)rgba;
+    (void)stride;
+    (void)timestamp_us;
+    (void)force_keyframe;
+    (void)is_keyframe;
+    (void)data;
+    (void)capacity;
+    return 0;
+#else
+    if (!codecs || !rgba || !data || capacity <= 0 || stride <= 0 ||
+        !av_codecs_init_h264_encoder(codecs))
+        return 0;
+    AVFrame *frame = codecs->h264_encoder_frame;
+    if (av_frame_make_writable(frame) < 0)
+        return 0;
+
+    if (!codecs->encoder_scaler) {
+        codecs->encoder_scaler = sws_getContext(frame->width, frame->height,
+            AV_PIX_FMT_RGBA, frame->width, frame->height,
+            (enum AVPixelFormat)frame->format, SWS_BILINEAR,
+            NULL, NULL, NULL);
+    }
+    if (!codecs->encoder_scaler)
+        return 0;
+    const uint8_t *source[] = {rgba, NULL, NULL, NULL};
+    int source_stride[] = {stride, 0, 0, 0};
+    if (sws_scale(codecs->encoder_scaler, source, source_stride, 0,
+            frame->height, frame->data, frame->linesize) != frame->height)
+        return 0;
+
+    frame->pts = (int64_t)(timestamp_us * (uint64_t)codecs->video_fps /
+        1000000ULL);
+#if LIBAVUTIL_VERSION_MAJOR >= 58
+    if (force_keyframe)
+        frame->flags |= AV_FRAME_FLAG_KEY;
+    else
+        frame->flags &= ~AV_FRAME_FLAG_KEY;
+#else
+    frame->key_frame = force_keyframe ? 1 : 0;
+    frame->pict_type = force_keyframe ? AV_PICTURE_TYPE_I
+        : AV_PICTURE_TYPE_NONE;
+#endif
+    if (avcodec_send_frame(codecs->h264_encoder_context, frame) < 0)
+        return 0;
+    AVPacket *packet = codecs->h264_encoder_packet;
+    av_packet_unref(packet);
+    if (avcodec_receive_packet(codecs->h264_encoder_context, packet) < 0)
+        return 0;
+    if (packet->size > capacity)
+        return 0;
+    memcpy(data, packet->data, (size_t)packet->size);
+    if (is_keyframe)
+        *is_keyframe = (packet->flags & AV_PKT_FLAG_KEY) != 0;
+    return packet->size;
+#endif
+}
+
 int av_codecs_decode_opus(AvCodecs *codecs, const uint8_t *data,
     uint16_t length, bool reset, int16_t *pcm, int pcm_capacity)
 {
@@ -220,9 +360,9 @@ int av_codecs_decode_opus(AvCodecs *codecs, const uint8_t *data,
 int av_codecs_encode_opus(AvCodecs *codecs, const int16_t *pcm,
     int sample_count, uint8_t *data, int capacity)
 {
-    if (!codecs || !codecs->opus_encoder || capacity <= 0)
+    if (!codecs || !codecs->opus_audio_encoder || capacity <= 0)
         return 0;
-    int encoded = opus_encode(codecs->opus_encoder, pcm, sample_count,
+    int encoded = opus_encode(codecs->opus_audio_encoder, pcm, sample_count,
         data, capacity);
     return encoded > 0 ? encoded : 0;
 }
@@ -231,7 +371,7 @@ int av_codecs_capture_microphone(AvCodecs *codecs,
     AvMicrophoneReadCallback read_callback, void *read_context,
     uint8_t *data, int capacity)
 {
-    if (!codecs || !codecs->opus_encoder || !read_callback ||
+    if (!codecs || !codecs->opus_microphone_encoder || !read_callback ||
         codecs->microphone_frame_bytes == 0)
         return 0;
     while (codecs->microphone_pcm_bytes < codecs->microphone_frame_bytes) {
@@ -245,7 +385,8 @@ int av_codecs_capture_microphone(AvCodecs *codecs,
         codecs->microphone_pcm_bytes += received > missing
             ? missing : received;
     }
-    int encoded = opus_encode(codecs->opus_encoder, codecs->microphone_pcm,
+    int encoded = opus_encode(codecs->opus_microphone_encoder,
+        codecs->microphone_pcm,
         codecs->microphone_frame_samples, data, capacity);
     codecs->microphone_pcm_bytes = 0;
     return encoded > 0 ? encoded : 0;
@@ -259,9 +400,9 @@ void av_codecs_discard_microphone_input(AvCodecs *codecs)
 
 void av_codecs_reset_microphone_encoder(AvCodecs *codecs)
 {
-    if (!codecs || !codecs->opus_encoder)
+    if (!codecs || !codecs->opus_microphone_encoder)
         return;
-    opus_encoder_ctl(codecs->opus_encoder, OPUS_RESET_STATE);
+    opus_encoder_ctl(codecs->opus_microphone_encoder, OPUS_RESET_STATE);
     codecs->microphone_pcm_bytes = 0;
 }
 

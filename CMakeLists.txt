@@ -49,6 +49,19 @@ if(NOT NINTENDO_SWITCH)
     )
     target_compile_options(dsu-controller PRIVATE -Wall -Wextra -Werror)
     target_compile_features(dsu-controller PRIVATE c_std_11)
+
+    add_executable(dsu-snake
+        samples/dsu_snake.c
+    )
+    target_link_libraries(dsu-snake
+        PRIVATE
+            av::codecs
+            dsu::client
+            SDL2::SDL2
+            SDL2::SDL2main
+    )
+    target_compile_options(dsu-snake PRIVATE -Wall -Wextra -Werror)
+    target_compile_features(dsu-snake PRIVATE c_std_11)
     return()
 endif()
 
