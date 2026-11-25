@@ -35,6 +35,7 @@ if(NOT NINTENDO_SWITCH)
     add_executable(dsu-controller
         app/main.c
         app/sdl_display.c
+        app/controller.c
         platform/desktop.c
     )
     target_link_libraries(dsu-controller
@@ -59,6 +60,7 @@ endif()
 add_executable(${DSU_SWITCH_TARGET}
     app/main.c
     app/sdl_display.c
+    app/controller.c
     platform/switch.c
     platform/switch_av.c
 )
