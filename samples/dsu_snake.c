@@ -362,7 +362,7 @@ static void on_keyframe(void *context, uint32_t last_sequence,
 
 static void produce_audio(SnakeGame *game, uint64_t timestamp_us)
 {
-    double frequency = game->tone_active ? 660.0 : 110.0;
+    double frequency = game->tone_active ? 660.0 : 220.0;
     if (timestamp_us > game->tone_until_us)
         game->tone_active = false;
     double amplitude = game->tone_active ? 18000.0 : 12000.0;
