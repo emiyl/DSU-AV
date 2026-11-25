@@ -1,5 +1,7 @@
 #include "switch_av.h"
 #include <av/av_codecs.h>
+#include "../app/av_playback.h"
+#include "../app/microphone.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -17,25 +19,18 @@
 #define DISPLAY_HEIGHT 720
 #define MAX_ENCODED_FRAME (1024 * 1024)
 #define MAX_OPUS_SAMPLES 2880
-#define AUDIO_QUEUE_LIMIT (48000 * 2 * 2 / 5)
 #define MICROPHONE_QUEUE_LIMIT (48000 * 2 / 5)
 
 struct SwitchAv {
     DsuServer *server;
-    DsuAvCapabilities capabilities;
+    AppAvPlayback *playback;
     DsuAvCallbacks callbacks;
-    DsuAvSessionSettings settings;
     bool active;
     SdlDisplay *display;
-    bool microphone_enabled;
-    bool microphone_requested;
-    uint8_t microphone_state;
+    AppMicrophone microphone;
 
-    SDL_AudioDeviceID output_device;
     SDL_AudioDeviceID capture_device;
-    AvCodecs *codecs;
     uint8_t opus_output[1500];
-    int16_t opus_pcm[MAX_OPUS_SAMPLES * 2];
 
 #ifdef __SWITCH2__
     VideoDecoder decoder;
@@ -44,18 +39,6 @@ struct SwitchAv {
     uint32_t codec_config_size;
 #endif
 };
-
-static void render_frame(SwitchAv *media, const AvDecodedFrame *frame)
-{
-    sdl_display_frame(media->display, media->codecs, frame);
-}
-
-#ifndef __SWITCH2__
-static void decoded_video_frame(void *context, const AvDecodedFrame *frame)
-{
-    render_frame(context, frame);
-}
-#endif
 
 #ifdef __SWITCH2__
 static void decode_hardware_video(SwitchAv *media, const uint8_t *data,
@@ -67,9 +50,9 @@ static void decode_hardware_video(SwitchAv *media, const uint8_t *data,
             return;
         VideoDecoderConfig config = {
             .codec = ViddecCodec_H264,
-            .width = media->settings.video_width,
-            .height = media->settings.video_height,
-            .frame_rate = media->settings.video_fps,
+            .width = app_av_playback_settings(media->playback)->video_width,
+            .height = app_av_playback_settings(media->playback)->video_height,
+            .frame_rate = app_av_playback_settings(media->playback)->video_fps,
             .tiling = ViddecTilingMode_PitchLinear,
             .max_sample_size = MAX_ENCODED_FRAME,
             .codec_config = media->codec_config,
@@ -98,46 +81,22 @@ static void decode_hardware_video(SwitchAv *media, const uint8_t *data,
             .width = (int)frame.width,
             .height = (int)frame.height,
         };
-        render_frame(media, &decoded);
+        sdl_display_frame(media->display,
+            app_av_playback_codecs(media->playback), &decoded);
         videoDecoderReleaseFrame(&media->decoder, &frame);
     }
 }
-#endif
 
-static void video_frame(void *context, uint64_t timestamp_us, uint8_t flags,
-    const uint8_t *data, uint32_t length)
+static bool hardware_video_submit(void *context, const uint8_t *data,
+    uint32_t length, uint64_t timestamp_us)
 {
     SwitchAv *media = context;
-    (void)flags;
-    if (!media->active || length > MAX_ENCODED_FRAME)
-        return;
-#ifdef __SWITCH2__
+    if (length > MAX_ENCODED_FRAME)
+        return false;
     decode_hardware_video(media, data, length, timestamp_us);
-#else
-    av_codecs_submit_h264(media->codecs, data, length, timestamp_us);
+    return true;
+}
 #endif
-}
-
-static void audio_packet(void *context, uint32_t sequence,
-    uint64_t timestamp_us, uint32_t packet_id, uint8_t flags,
-    const uint8_t *data, uint16_t length)
-{
-    (void)sequence;
-    (void)timestamp_us;
-    (void)packet_id;
-    SwitchAv *media = context;
-    if (!media->output_device)
-        return;
-    int samples = av_codecs_decode_opus(media->codecs, data, length,
-        (flags & 0x01) != 0, media->opus_pcm, MAX_OPUS_SAMPLES);
-    if (samples <= 0)
-        return;
-    if ((uint32_t)SDL_GetQueuedAudioSize(media->output_device) >
-        AUDIO_QUEUE_LIMIT)
-        SDL_ClearQueuedAudio(media->output_device);
-    SDL_QueueAudio(media->output_device, media->opus_pcm,
-        (Uint32)(samples * media->settings.audio_channels * sizeof(int16_t)));
-}
 
 static void close_media_session(SwitchAv *media)
 {
@@ -147,12 +106,6 @@ static void close_media_session(SwitchAv *media)
         SDL_CloseAudioDevice(media->capture_device);
         media->capture_device = 0;
     }
-    if (media->output_device) {
-        SDL_CloseAudioDevice(media->output_device);
-        media->output_device = 0;
-    }
-    av_codecs_destroy(media->codecs);
-    media->codecs = NULL;
 #ifdef __SWITCH2__
     if (media->decoder_created) {
         videoDecoderClose(&media->decoder);
@@ -160,64 +113,44 @@ static void close_media_session(SwitchAv *media)
     }
 #endif
     media->active = false;
-    media->microphone_enabled = false;
-    media->microphone_requested = false;
-    media->microphone_state = 0;
+    app_microphone_session_stop(&media->microphone);
 }
 
 static bool session_start(void *context, const DsuAvSessionSettings *settings)
 {
     SwitchAv *media = context;
     close_media_session(media);
-    media->settings = *settings;
-    media->codecs = av_codecs_create(settings);
-    if (!media->codecs)
-        goto fail;
-
-    if (settings->audio_codec != DSU_AV_CODEC_NONE) {
-        SDL_AudioSpec desired = {
-            .freq = settings->audio_sample_rate_div100 * 100,
-            .format = AUDIO_S16SYS,
-            .channels = settings->audio_channels,
-            .samples = 256,
-        };
-        SDL_AudioSpec obtained;
-        media->output_device = SDL_OpenAudioDevice(
-            NULL, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
-        if (!media->output_device ||
-            obtained.freq != desired.freq ||
-            obtained.channels != desired.channels) {
-            goto fail;
-        }
-        SDL_PauseAudioDevice(media->output_device, 0);
-    }
-
+    const DsuAvCallbacks *callbacks =
+        app_av_playback_callbacks(media->playback);
+    if (!callbacks->session_start(media->playback, settings))
+        return false;
     if (settings->microphone_codec != DSU_AV_CODEC_NONE) {
-        media->microphone_requested = true;
-        media->microphone_state = 1;
+        app_microphone_session_start(&media->microphone);
     }
 
     media->active = true;
     return true;
-
-fail:
-    close_media_session(media);
-    return false;
 }
 
 static void session_stop(void *context)
 {
-    close_media_session(context);
+    SwitchAv *media = context;
+    close_media_session(media);
+    app_av_playback_callbacks(media->playback)->session_stop(
+        media->playback);
 }
 
 static bool start_microphone(SwitchAv *media)
 {
-    if (!media->microphone_requested || media->capture_device)
+    if (!app_microphone_is_requested(&media->microphone) ||
+        media->capture_device)
         return media->capture_device != 0;
     SDL_AudioSpec desired = {
-        .freq = media->settings.microphone_sample_rate_div100 * 100,
+        .freq = app_av_playback_settings(media->playback)->
+            microphone_sample_rate_div100 * 100,
         .format = AUDIO_S16SYS,
-        .channels = media->settings.microphone_channels,
+        .channels = app_av_playback_settings(media->playback)->
+            microphone_channels,
         .samples = 480,
     };
     SDL_AudioSpec obtained;
@@ -228,15 +161,14 @@ static bool start_microphone(SwitchAv *media)
         if (media->capture_device)
             SDL_CloseAudioDevice(media->capture_device);
         media->capture_device = 0;
-        media->microphone_state = 4;
-        dsu_server_av_set_microphone_state(media->server, 4, 3);
+        app_microphone_set_state(&media->microphone,
+            APP_MIC_UNAVAILABLE, 3);
         return false;
     }
     SDL_PauseAudioDevice(media->capture_device, 0);
-    av_codecs_reset_microphone_encoder(media->codecs);
-    media->microphone_enabled = true;
-    media->microphone_state = 3;
-    dsu_server_av_set_microphone_state(media->server, 3, 1);
+    av_codecs_reset_microphone_encoder(
+        app_av_playback_codecs(media->playback));
+    app_microphone_set_state(&media->microphone, APP_MIC_CAPTURING, 1);
     return true;
 }
 
@@ -248,12 +180,10 @@ static void stop_microphone(SwitchAv *media)
         SDL_CloseAudioDevice(media->capture_device);
         media->capture_device = 0;
     }
-    media->microphone_enabled = false;
-    av_codecs_discard_microphone_input(media->codecs);
-    if (media->microphone_requested)
-        media->microphone_state = 2;
-    if (media->microphone_requested)
-        dsu_server_av_set_microphone_state(media->server, 2, 1);
+    av_codecs_discard_microphone_input(
+        app_av_playback_codecs(media->playback));
+    if (app_microphone_is_requested(&media->microphone))
+        app_microphone_set_state(&media->microphone, APP_MIC_MUTED, 1);
 }
 
 static uint32_t read_microphone_pcm(void *context, int16_t *samples,
@@ -267,32 +197,33 @@ void switch_av_poll(SwitchAv *media)
 {
     if (!media || !media->active)
         return;
-#ifndef __SWITCH2__
-    av_codecs_poll_video(media->codecs, decoded_video_frame, media);
-#endif
-    if (!media->capture_device || !media->microphone_enabled)
+    app_av_playback_poll(media->playback);
+    if (!media->capture_device ||
+        !app_microphone_is_capturing(&media->microphone))
         return;
 
     if (SDL_GetQueuedAudioSize(media->capture_device) >
         MICROPHONE_QUEUE_LIMIT) {
         SDL_ClearQueuedAudio(media->capture_device);
-        av_codecs_discard_microphone_input(media->codecs);
+        av_codecs_discard_microphone_input(
+            app_av_playback_codecs(media->playback));
     }
-    int encoded = av_codecs_capture_microphone(media->codecs,
+    int encoded = av_codecs_capture_microphone(
+        app_av_playback_codecs(media->playback),
         read_microphone_pcm, (void *)(uintptr_t)media->capture_device,
         media->opus_output, sizeof(media->opus_output));
     if (encoded > 0)
-        dsu_server_av_send_microphone(media->server,
+        app_microphone_send(&media->microphone,
             av_codecs_monotonic_us(),
-            0, media->opus_output, (uint16_t)encoded);
+            media->opus_output, (uint16_t)encoded);
 }
 
 void switch_av_handle_input(SwitchAv *media, uint64_t buttons_down)
 {
-    if (!media || !media->microphone_requested ||
+    if (!media || !app_microphone_is_requested(&media->microphone) ||
         !(buttons_down & HidNpadButton_A))
         return;
-    if (media->microphone_enabled)
+    if (app_microphone_is_capturing(&media->microphone))
         stop_microphone(media);
     else
         start_microphone(media);
@@ -300,7 +231,7 @@ void switch_av_handle_input(SwitchAv *media, uint64_t buttons_down)
 
 const DsuAvCapabilities *switch_av_capabilities(const SwitchAv *media)
 {
-    return &media->capabilities;
+    return app_av_playback_capabilities(media->playback);
 }
 
 const DsuAvCallbacks *switch_av_callbacks(const SwitchAv *media)
@@ -319,33 +250,32 @@ SwitchAv *switch_av_create(DsuServer *server, SdlDisplay *display)
     if (!media)
         return NULL;
     media->server = server;
+    app_microphone_init(&media->microphone, server);
     media->display = display;
-    media->capabilities = (DsuAvCapabilities) {
-        .flags = DSU_AV_CAP_VIDEO | DSU_AV_CAP_AUDIO |
-            DSU_AV_CAP_KEYFRAME | DSU_AV_CAP_QUALITY |
-            DSU_AV_CAP_MICROPHONE | DSU_AV_CAP_UNAUTHENTICATED,
-        .video_codec = DSU_AV_CODEC_H264,
-        .audio_codec = DSU_AV_CODEC_OPUS,
-        .video_width = DISPLAY_WIDTH,
-        .video_height = DISPLAY_HEIGHT,
-        .video_fps = 60,
-        .video_bitrate_kbps = 8000,
-        .audio_sample_rate_div100 = 480,
-        .audio_channels = 2,
-        .audio_frame_duration_01ms = 100,
-        .payload_limit = 1100,
-        .microphone_codec = DSU_AV_CODEC_OPUS,
-        .microphone_sample_rate_div100 = 480,
-        .microphone_channels = 1,
-        .microphone_frame_duration_01ms = 100,
-    };
+    media->playback = app_av_playback_create(display, true,
+#ifdef __SWITCH2__
+        &(AppAvVideoBackend){
+            .context = media,
+            .video_submit = hardware_video_submit,
+        }
+#else
+        NULL
+#endif
+    );
+    if (!media->playback) {
+        free(media);
+        return NULL;
+    }
     media->callbacks = (DsuAvCallbacks) {
         .session_start = session_start,
         .session_stop = session_stop,
-        .video_frame = video_frame,
-        .audio_packet = audio_packet,
+        .video_frame =
+            app_av_playback_callbacks(media->playback)->video_frame,
+        .audio_packet =
+            app_av_playback_callbacks(media->playback)->audio_packet,
     };
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        app_av_playback_destroy(media->playback);
         free(media);
         return NULL;
     }
@@ -357,6 +287,7 @@ void switch_av_destroy(SwitchAv *media)
     if (!media)
         return;
     close_media_session(media);
+    app_av_playback_destroy(media->playback);
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
     free(media);
 }

@@ -3,6 +3,7 @@
 #include "../app/platform.h"
 #include "../app/sdl_display.h"
 #include "../app/controller.h"
+#include "../app/hold.h"
 
 #include <arpa/inet.h>
 #include <inttypes.h>
@@ -31,7 +32,7 @@ struct AppPlatform {
     bool nifm_initialized;
     uint64_t frame;
     uint64_t controller_buttons;
-    uint64_t exit_hold_started_us;
+    AppHold exit_hold;
 };
 
 static uint64_t clock_us(void)
@@ -216,11 +217,8 @@ bool app_platform_running(AppPlatform *platform)
     bool exit_buttons_held =
         (buttons & (HidNpadButton_Plus | HidNpadButton_Minus)) ==
         (HidNpadButton_Plus | HidNpadButton_Minus);
-    if (!exit_buttons_held)
-        platform->exit_hold_started_us = 0;
-    else if (platform->exit_hold_started_us == 0)
-        platform->exit_hold_started_us = now_us;
-    else if (now_us - platform->exit_hold_started_us >= EXIT_HOLD_US)
+    if (app_hold_update(&platform->exit_hold, exit_buttons_held, now_us,
+            EXIT_HOLD_US))
         return false;
     return true;
 }
