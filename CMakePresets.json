@@ -1,0 +1,34 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "switch1",
+      "displayName": "Nintendo Switch",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/switch1",
+      "toolchainFile": "/opt/devkitpro/cmake/Switch.cmake"
+    },
+    {
+      "name": "switch2",
+      "displayName": "Nintendo Switch 2",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/switch2",
+      "toolchainFile": "/opt/devkitpro/libounce/cmake/Switch2.cmake"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "switch1",
+      "configurePreset": "switch1"
+    },
+    {
+      "name": "switch2",
+      "configurePreset": "switch2"
+    }
+  ]
+}
