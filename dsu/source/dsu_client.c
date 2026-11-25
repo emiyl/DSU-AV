@@ -175,6 +175,15 @@ static bool send_packet(DsuClientInternal *client, uint32_t type,
         (ssize_t)(DSU_HEADER_SIZE + payload_length);
 }
 
+static void pause_video_fragment(void)
+{
+    struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = 250000,
+    };
+    nanosleep(&delay, NULL);
+}
+
 static void send_subscription(DsuClientInternal *client)
 {
     uint8_t selection[8] = {0};
@@ -568,6 +577,8 @@ bool dsu_client_send_video(DsuClient *client, uint64_t timestamp_us,
                 data + sent, fragment_length))
             return false;
         sent += fragment_length;
+        if (fragment_count > 1 && fragment + 1U < fragment_count)
+            pause_video_fragment();
     }
     return true;
 }

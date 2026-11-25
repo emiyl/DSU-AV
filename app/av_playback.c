@@ -46,8 +46,17 @@ static bool session_start(void *context,
             NULL, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
         if (!playback->audio_device ||
             obtained.freq != desired.freq ||
-            obtained.channels != desired.channels)
+            obtained.channels != desired.channels) {
+            SDL_LogError(SDL_LOG_CATEGORY_AUDIO,
+                "Could not open requested audio device (%d Hz, %u channels, "
+                "format 0x%x): %s", desired.freq,
+                (unsigned)desired.channels, (unsigned)desired.format,
+                SDL_GetError());
             goto fail;
+        }
+        SDL_Log("Audio output opened: %d Hz, %u channels, %u samples",
+            obtained.freq, (unsigned)obtained.channels,
+            (unsigned)obtained.samples);
         SDL_PauseAudioDevice(playback->audio_device, 0);
     }
     playback->active = true;
@@ -91,8 +100,8 @@ static void video_frame(void *context, uint64_t timestamp_us, uint8_t flags,
     if (!playback->active)
         return;
     if (playback->video_backend.video_submit) {
-        playback->video_backend.video_submit(playback->video_backend.context,
-            data, length, timestamp_us);
+        playback->video_backend.video_submit(
+            playback->video_backend.context, data, length, timestamp_us);
     } else {
         av_codecs_submit_h264(playback->codecs, data, length, timestamp_us);
     }
@@ -106,18 +115,32 @@ static void audio_packet(void *context, uint32_t sequence,
     (void)timestamp_us;
     (void)packet_id;
     AppAvPlayback *playback = context;
-    if (!playback->audio_device)
+    if (!playback->audio_device) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
+            "Received audio before an output device was available.");
         return;
+    }
     int samples = av_codecs_decode_opus(playback->codecs, data, length,
         (flags & 0x01) != 0, playback->pcm, MAX_OPUS_SAMPLES);
-    if (samples <= 0)
+    if (samples <= 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
+            "Could not decode DSU Opus audio packet (%u bytes).",
+            (unsigned)length);
         return;
+    }
     if ((uint32_t)SDL_GetQueuedAudioSize(playback->audio_device) >
         AUDIO_QUEUE_LIMIT)
         SDL_ClearQueuedAudio(playback->audio_device);
-    SDL_QueueAudio(playback->audio_device, playback->pcm,
+    if (SDL_QueueAudio(playback->audio_device, playback->pcm,
         (Uint32)(samples * playback->settings.audio_channels *
-            sizeof(int16_t)));
+            sizeof(int16_t))) < 0) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
+            "Could not queue decoded audio: %s", SDL_GetError());
+        return;
+    }
+    if (SDL_GetAudioDeviceStatus(playback->audio_device) !=
+            SDL_AUDIO_PLAYING)
+        SDL_PauseAudioDevice(playback->audio_device, 0);
 }
 
 static void render_video_frame(void *context, const AvDecodedFrame *frame)

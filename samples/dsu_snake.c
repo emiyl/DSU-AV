@@ -40,8 +40,10 @@ typedef struct {
     DsuClient client;
     AvCodecs *codecs;
     DsuAvCapabilities capabilities;
+    DsuAvSessionSettings desired_settings;
     bool capabilities_received;
     bool session_started;
+    uint64_t next_session_attempt_us;
     bool force_keyframe;
     uint64_t media_start_us;
     uint64_t last_video_us;
@@ -158,13 +160,17 @@ static void move_snake(SnakeGame *game)
     else
         ++next.x;
 
+    if (next.x < 0)
+        next.x = GRID_COLUMNS - 1;
+    else if (next.x >= GRID_COLUMNS)
+        next.x = 0;
+    if (next.y < 0)
+        next.y = GRID_ROWS - 1;
+    else if (next.y >= GRID_ROWS)
+        next.y = 0;
+
     bool ate_food = next.x == game->food.x && next.y == game->food.y;
     size_t collision_length = game->snake_length - (ate_food ? 0 : 1);
-    if (next.x < 0 || next.x >= GRID_COLUMNS ||
-        next.y < 0 || next.y >= GRID_ROWS) {
-        game->game_over = true;
-        return;
-    }
     for (size_t i = 0; i < collision_length; ++i) {
         if (game->snake[i].x == next.x && game->snake[i].y == next.y) {
             game->game_over = true;
@@ -190,9 +196,16 @@ static void move_snake(SnakeGame *game)
 
 static void render_game(SnakeGame *game)
 {
+    uint8_t background[VIDEO_WIDTH * 4];
+    for (int x = 0; x < VIDEO_WIDTH; ++x) {
+        background[x * 4] = 10;
+        background[x * 4 + 1] = 18;
+        background[x * 4 + 2] = 28;
+        background[x * 4 + 3] = 255;
+    }
     for (int y = 0; y < VIDEO_HEIGHT; ++y) {
-        for (int x = 0; x < VIDEO_WIDTH; ++x)
-            put_pixel(game, x, y, 10, 18, 28);
+        memcpy(game->framebuffer + (size_t)y * sizeof(background),
+            background, sizeof(background));
     }
 
     for (int x = 0; x <= GRID_COLUMNS; ++x)
@@ -297,7 +310,8 @@ static void on_capabilities(void *context,
         return;
     }
     if (!dsu_client_start_media(&game->client, &settings))
-        fprintf(stderr, "Could not request a DSU-AV session.\n");
+        game->next_session_attempt_us = monotonic_us() + 1000000;
+    game->desired_settings = settings;
 }
 
 static void on_media_session(void *context, bool started, uint8_t status,
@@ -307,6 +321,7 @@ static void on_media_session(void *context, bool started, uint8_t status,
     if (!started) {
         fprintf(stderr, "DSU-AV session rejected (status %u).\n",
             (unsigned)status);
+        game->next_session_attempt_us = monotonic_us() + 1000000;
         return;
     }
     game->codecs = av_codecs_create(settings);
@@ -331,6 +346,7 @@ static void on_media_stopped(void *context, uint8_t reason)
     SnakeGame *game = context;
     printf("Media session stopped (reason %u).\n", (unsigned)reason);
     game->session_started = false;
+    game->next_session_attempt_us = monotonic_us() + 1000000;
     av_codecs_destroy(game->codecs);
     game->codecs = NULL;
 }
@@ -349,7 +365,7 @@ static void produce_audio(SnakeGame *game, uint64_t timestamp_us)
     double frequency = game->tone_active ? 660.0 : 110.0;
     if (timestamp_us > game->tone_until_us)
         game->tone_active = false;
-    double amplitude = game->tone_active ? 7000.0 : 900.0;
+    double amplitude = game->tone_active ? 18000.0 : 12000.0;
     for (int i = 0; i < AUDIO_SAMPLES; ++i) {
         double sample = sin(game->audio_phase) * amplitude;
         game->audio_pcm[i * AUDIO_CHANNELS] = (int16_t)sample;
@@ -379,7 +395,9 @@ int main(int argc, char **argv)
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         VIDEO_WIDTH, VIDEO_HEIGHT, 0);
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        SDL_RENDERER_ACCELERATED);
+    if (!renderer)
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     SDL_Texture *texture = SDL_CreateTexture(renderer,
         SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
         VIDEO_WIDTH, VIDEO_HEIGHT);
@@ -438,10 +456,44 @@ int main(int argc, char **argv)
                 (event.type == SDL_KEYDOWN &&
                     event.key.keysym.sym == SDLK_ESCAPE))
                 running = false;
+            else if (event.type == SDL_KEYDOWN) {
+                switch (event.key.keysym.sym) {
+                case SDLK_LEFT:
+                case SDLK_a:
+                    game.pending_direction = DIRECTION_LEFT;
+                    break;
+                case SDLK_DOWN:
+                case SDLK_s:
+                    game.pending_direction = DIRECTION_DOWN;
+                    break;
+                case SDLK_RIGHT:
+                case SDLK_d:
+                    game.pending_direction = DIRECTION_RIGHT;
+                    break;
+                case SDLK_UP:
+                case SDLK_w:
+                    game.pending_direction = DIRECTION_UP;
+                    break;
+                case SDLK_SPACE:
+                    if (game.game_over)
+                        reset_game(&game);
+                    else
+                        game.paused = !game.paused;
+                    break;
+                default:
+                    break;
+                }
+            }
         }
         dsu_client_poll(&game.client);
 
         uint64_t now = monotonic_us();
+        if (game.capabilities_received && !game.session_started &&
+            !dsu_client_media_active(&game.client) &&
+            now >= game.next_session_attempt_us) {
+            game.next_session_attempt_us = now + 1000000;
+            dsu_client_start_media(&game.client, &game.desired_settings);
+        }
         while (now >= game.next_move_us) {
             move_snake(&game);
             game.next_move_us += 120000;
@@ -465,10 +517,12 @@ int main(int argc, char **argv)
                         game.encoded_video, (uint32_t)encoded);
                 }
             }
-            while (now >= game.next_audio_us) {
+            if (now >= game.next_audio_us) {
                 produce_audio(&game, game.next_audio_us);
-                game.next_audio_us += 10000;
-                now = monotonic_us();
+                if (now - game.next_audio_us > 100000)
+                    game.next_audio_us = now + 10000;
+                else
+                    game.next_audio_us += 10000;
             }
         }
 
@@ -477,7 +531,7 @@ int main(int argc, char **argv)
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, NULL, NULL);
         SDL_RenderPresent(renderer);
-        SDL_Delay(1);
+        SDL_Delay(4);
     }
 
     dsu_client_close(&game.client);

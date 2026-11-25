@@ -41,13 +41,25 @@ struct SwitchAv {
 };
 
 #ifdef __SWITCH2__
-static void decode_hardware_video(SwitchAv *media, const uint8_t *data,
+static bool decode_hardware_video(SwitchAv *media, const uint8_t *data,
     uint32_t length, uint64_t timestamp_us)
 {
     if (!media->decoder_created) {
         if (!av_codecs_extract_h264_config(data, length, media->codec_config,
                 sizeof(media->codec_config), &media->codec_config_size))
-            return;
+            return false;
+        for (uint32_t i = 0; i + 3 < media->codec_config_size; ++i) {
+            if (media->codec_config[i] == 0 && media->codec_config[i + 1] == 0 &&
+                media->codec_config[i + 2] == 1 &&
+                (i == 0 || media->codec_config[i - 1] != 0)) {
+                if (media->codec_config_size > sizeof(media->codec_config) - 1)
+                    return false;
+                memmove(media->codec_config + i + 1,
+                    media->codec_config + i, media->codec_config_size - i);
+                ++media->codec_config_size;
+                i += 3;
+            }
+        }
         VideoDecoderConfig config = {
             .codec = ViddecCodec_H264,
             .width = app_av_playback_settings(media->playback)->video_width,
@@ -59,14 +71,14 @@ static void decode_hardware_video(SwitchAv *media, const uint8_t *data,
             .codec_config_size = media->codec_config_size,
         };
         if (R_FAILED(videoDecoderCreate(&media->decoder, &config)))
-            return;
+            return false;
         media->decoder_created = true;
     }
 
     if (R_FAILED(videoDecoderSubmit(&media->decoder, data, length,
             (s64)timestamp_us * 1000, false, 0))) {
         dsu_server_av_request_keyframe(media->server, 0, 1, 2);
-        return;
+        return false;
     }
 
     VideoFrame frame;
@@ -85,6 +97,7 @@ static void decode_hardware_video(SwitchAv *media, const uint8_t *data,
             app_av_playback_codecs(media->playback), &decoded);
         videoDecoderReleaseFrame(&media->decoder, &frame);
     }
+    return true;
 }
 
 static bool hardware_video_submit(void *context, const uint8_t *data,
@@ -93,8 +106,10 @@ static bool hardware_video_submit(void *context, const uint8_t *data,
     SwitchAv *media = context;
     if (length > MAX_ENCODED_FRAME)
         return false;
-    decode_hardware_video(media, data, length, timestamp_us);
-    return true;
+    bool accepted = decode_hardware_video(media, data, length, timestamp_us);
+    if (!accepted)
+        dsu_server_av_request_keyframe(media->server, 0, 1, 2);
+    return accepted;
 }
 #endif
 
@@ -114,6 +129,22 @@ static void close_media_session(SwitchAv *media)
 #endif
     media->active = false;
     app_microphone_session_stop(&media->microphone);
+}
+
+static void receive_video(void *context, uint64_t timestamp_us, uint8_t flags,
+    const uint8_t *data, uint32_t length)
+{
+    SwitchAv *media = context;
+#ifdef __SWITCH2__
+    (void)flags;
+    app_av_playback_callbacks(media->playback)->video_frame(
+        media->playback, timestamp_us, flags, data, length);
+#else
+    (void)flags;
+    if (!av_codecs_submit_h264(app_av_playback_codecs(media->playback),
+            data, length, timestamp_us))
+        dsu_server_av_request_keyframe(media->server, 0, 1, 2);
+#endif
 }
 
 static bool session_start(void *context, const DsuAvSessionSettings *settings)
@@ -269,8 +300,7 @@ SwitchAv *switch_av_create(DsuServer *server, SdlDisplay *display)
     media->callbacks = (DsuAvCallbacks) {
         .session_start = session_start,
         .session_stop = session_stop,
-        .video_frame =
-            app_av_playback_callbacks(media->playback)->video_frame,
+        .video_frame = receive_video,
         .audio_packet =
             app_av_playback_callbacks(media->playback)->audio_packet,
     };
