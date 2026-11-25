@@ -1,4 +1,5 @@
 #include <dsu/dsu_server.h>
+#include "switch_av.h"
 
 #include <arpa/inet.h>
 #include <inttypes.h>
@@ -88,16 +89,32 @@ static void analog_button_values(uint8_t values[16], uint64_t buttons)
 }
 
 static void update_controller_state(DsuControllerState *state, const PadState *pad,
-    const HidSixAxisSensorHandle handles[MOTION_HANDLES])
+    const HidSixAxisSensorHandle handles[MOTION_HANDLES], uint64_t *buttons)
 {
     memset(state, 0, sizeof(*state));
     state->connected = padIsConnected(pad);
-    state->buttons = padGetButtons(pad);
+    *buttons = padGetButtons(pad);
+    const uint64_t first_buttons[8] = {
+        HidNpadButton_Left, HidNpadButton_Down, HidNpadButton_Right,
+        HidNpadButton_Up, HidNpadButton_Plus, HidNpadButton_StickR,
+        HidNpadButton_StickL, HidNpadButton_Minus,
+    };
+    const uint64_t second_buttons[8] = {
+        HidNpadButton_Y, HidNpadButton_B, HidNpadButton_A,
+        HidNpadButton_X, HidNpadButton_R, HidNpadButton_L,
+        HidNpadButton_ZR, HidNpadButton_ZL,
+    };
+    for (unsigned i = 0; i < 8; ++i) {
+        if (*buttons & first_buttons[i])
+            state->button_masks[0] |= (uint8_t)(0x80U >> i);
+        if (*buttons & second_buttons[i])
+            state->button_masks[1] |= (uint8_t)(0x80U >> i);
+    }
     state->left_stick_x = axis_to_dsu(padGetStickPos(pad, 0).x);
     state->left_stick_y = axis_to_dsu(padGetStickPos(pad, 0).y);
     state->right_stick_x = axis_to_dsu(padGetStickPos(pad, 1).x);
     state->right_stick_y = axis_to_dsu(padGetStickPos(pad, 1).y);
-    analog_button_values(state->analog_buttons, state->buttons);
+    analog_button_values(state->analog_buttons, *buttons);
 
     HidSixAxisSensorState motion = {0};
     if (read_motion(pad, handles, &motion)) {
@@ -113,7 +130,8 @@ static void update_controller_state(DsuControllerState *state, const PadState *p
 }
 
 static void print_status(const char *ip_address, const DsuServer *server,
-    const DsuControllerState *controller)
+    const DsuControllerState *controller, const SwitchAv *media,
+    uint64_t buttons)
 {
     printf("\x1b[1;1H");
     printf("DSU Controller Server\n");
@@ -123,13 +141,17 @@ static void print_status(const char *ip_address, const DsuServer *server,
         server->subscriptions > 0 ? server->last_client : "waiting for subscription");
     printf("Inputs   : %s\n", controller->connected ? "controller connected" :
         "controller disconnected");
+    printf("DSU-AV   : %s%s\n", dsu_server_av_is_active(server) ?
+        "session active" : "ready",
+        switch_av_is_video_visible(media) ? " (video)" : "");
     printf("Sent     : %" PRIu32 " packets\n", server->packets_sent);
-    printf("Buttons  : 0x%016" PRIx64 "\n", controller->buttons);
+    printf("Buttons  : 0x%016" PRIx64 "\n", buttons);
     printf("L stick  : %3u, %3u\n", controller->left_stick_x,
         controller->left_stick_y);
     printf("R stick  : %3u, %3u\n", controller->right_stick_x,
         controller->right_stick_y);
-    printf("\nHold PLUS + MINUS for 3 seconds to exit.\n");
+    printf("\nPress A to enable/mute the microphone when requested.\n");
+    printf("Hold PLUS + MINUS for 3 seconds to exit.\n");
 }
 
 int main(void)
@@ -154,9 +176,24 @@ int main(void)
 
     DsuServer server = {0};
     Result socket_result = socketInitializeDefault();
-    bool server_ready = R_SUCCEEDED(socket_result) && dsu_server_init(&server);
+    uint32_t server_id = (uint32_t)svcGetSystemTick();
+    DsuServerConfig server_config = {
+        .server_id = server_id,
+        .controller_mac = {
+            0x02, 0x00, 0x44, (uint8_t)(server_id >> 16),
+            (uint8_t)(server_id >> 8), (uint8_t)server_id,
+        },
+    };
+    bool server_ready = R_SUCCEEDED(socket_result) &&
+        dsu_server_init(&server, &server_config);
+    SwitchAv *media = server_ready ? switch_av_create(&server) : NULL;
+    if (media) {
+        dsu_server_configure_av(&server, switch_av_capabilities(media),
+            switch_av_callbacks(media), media);
+    }
     uint64_t frame = 0;
     uint64_t exit_hold_started_us = 0;
+    uint64_t controller_buttons = 0;
     DsuControllerState controller = {0};
 
     if (!server_ready) {
@@ -170,6 +207,7 @@ int main(void)
     while (appletMainLoop()) {
         padUpdate(&pad);
         uint64_t buttons = padGetButtons(&pad);
+        uint64_t buttons_down = padGetButtonsDown(&pad);
         uint64_t now_us = clock_us();
         bool exit_buttons_held =
             (buttons & (HidNpadButton_Plus | HidNpadButton_Minus)) ==
@@ -181,21 +219,28 @@ int main(void)
         else if (now_us - exit_hold_started_us >= EXIT_HOLD_US)
             break;
 
-        update_controller_state(&controller, &pad, motion_handles);
+        switch_av_handle_input(media, buttons_down);
+        update_controller_state(&controller, &pad, motion_handles,
+            &controller_buttons);
         if (server_ready) {
             dsu_server_poll(&server, &controller);
+            switch_av_poll(media);
             dsu_server_broadcast(&server, &controller);
             dsu_server_expire_clients(&server);
         }
 
-        if ((frame++ % 25) == 0 && server_ready)
-            print_status(ip_address, &server, &controller);
+        if ((frame++ % 25) == 0 && server_ready &&
+            !switch_av_is_video_visible(media))
+            print_status(ip_address, &server, &controller, media,
+                controller_buttons);
 
-        consoleUpdate(NULL);
+        if (!switch_av_is_video_visible(media))
+            consoleUpdate(NULL);
         svcSleepThread(SEND_INTERVAL_NS);
     }
 
     dsu_server_close(&server);
+    switch_av_destroy(media);
     if (R_SUCCEEDED(socket_result))
         socketExit();
     if (R_SUCCEEDED(nifm_result))

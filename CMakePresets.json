@@ -7,6 +7,12 @@
   },
   "configurePresets": [
     {
+      "name": "desktop",
+      "displayName": "Desktop SDL controller",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/desktop"
+    },
+    {
       "name": "switch1",
       "displayName": "Nintendo Switch",
       "generator": "Unix Makefiles",
@@ -22,6 +28,10 @@
     }
   ],
   "buildPresets": [
+    {
+      "name": "desktop",
+      "configurePreset": "desktop"
+    },
     {
       "name": "switch1",
       "configurePreset": "switch1"
