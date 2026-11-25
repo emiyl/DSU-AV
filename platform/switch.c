@@ -2,6 +2,7 @@
 #include "switch_av.h"
 #include "../app/platform.h"
 #include "../app/sdl_display.h"
+#include "../app/controller.h"
 
 #include <arpa/inet.h>
 #include <inttypes.h>
@@ -32,16 +33,6 @@ struct AppPlatform {
     uint64_t controller_buttons;
     uint64_t exit_hold_started_us;
 };
-
-static uint8_t axis_to_dsu(int32_t axis)
-{
-    int64_t value = (int64_t)axis + 32768;
-    if (value < 0)
-        value = 0;
-    if (value > 65535)
-        value = 65535;
-    return (uint8_t)((value * 255 + 32767) / 65535);
-}
 
 static uint64_t clock_us(void)
 {
@@ -93,45 +84,30 @@ static bool read_motion(const PadState *pad,
     return hidGetSixAxisSensorStates(handle, state, 1) > 0;
 }
 
-static void analog_button_values(uint8_t values[16], uint64_t buttons)
-{
-    static const uint64_t button_map[12] = {
-        HidNpadButton_Left, HidNpadButton_Down, HidNpadButton_Right,
-        HidNpadButton_Up, HidNpadButton_Y, HidNpadButton_B,
-        HidNpadButton_A, HidNpadButton_X, HidNpadButton_R,
-        HidNpadButton_L, HidNpadButton_ZR, HidNpadButton_ZL,
-    };
-    for (unsigned i = 0; i < 12; ++i)
-        values[i] = (buttons & button_map[i]) != 0 ? 255 : 0;
-}
-
-static void update_controller_state(DsuControllerState *state, const PadState *pad,
+static void update_controller_state(AppControllerInput *state, const PadState *pad,
     const HidSixAxisSensorHandle handles[MOTION_HANDLES], uint64_t *buttons)
 {
-    memset(state, 0, sizeof(*state));
+    app_controller_neutral(state);
     state->connected = padIsConnected(pad);
     *buttons = padGetButtons(pad);
-    const uint64_t first_buttons[8] = {
+    const uint64_t switch_buttons[16] = {
         HidNpadButton_Left, HidNpadButton_Down, HidNpadButton_Right,
         HidNpadButton_Up, HidNpadButton_Plus, HidNpadButton_StickR,
         HidNpadButton_StickL, HidNpadButton_Minus,
-    };
-    const uint64_t second_buttons[8] = {
         HidNpadButton_Y, HidNpadButton_B, HidNpadButton_A,
         HidNpadButton_X, HidNpadButton_R, HidNpadButton_L,
         HidNpadButton_ZR, HidNpadButton_ZL,
     };
-    for (unsigned i = 0; i < 8; ++i) {
-        if (*buttons & first_buttons[i])
-            state->button_masks[0] |= (uint8_t)(0x80U >> i);
-        if (*buttons & second_buttons[i])
-            state->button_masks[1] |= (uint8_t)(0x80U >> i);
+    for (unsigned i = 0; i < 16; ++i) {
+        if (*buttons & switch_buttons[i])
+            state->buttons |= 1ULL << i;
     }
-    state->left_stick_x = axis_to_dsu(padGetStickPos(pad, 0).x);
-    state->left_stick_y = axis_to_dsu(padGetStickPos(pad, 0).y);
-    state->right_stick_x = axis_to_dsu(padGetStickPos(pad, 1).x);
-    state->right_stick_y = axis_to_dsu(padGetStickPos(pad, 1).y);
-    analog_button_values(state->analog_buttons, *buttons);
+    state->left_x = padGetStickPos(pad, 0).x;
+    state->left_y = padGetStickPos(pad, 0).y;
+    state->right_x = padGetStickPos(pad, 1).x;
+    state->right_y = padGetStickPos(pad, 1).y;
+    state->left_trigger = (*buttons & HidNpadButton_ZL) ? 32767 : 0;
+    state->right_trigger = (*buttons & HidNpadButton_ZR) ? 32767 : 0;
 
     HidSixAxisSensorState motion = {0};
     if (read_motion(pad, handles, &motion)) {
@@ -261,7 +237,7 @@ const char *app_platform_name(const AppPlatform *platform)
 }
 
 void app_platform_update_controller(AppPlatform *platform,
-    DsuControllerState *controller)
+    AppControllerInput *controller)
 {
     uint64_t buttons_down = padGetButtonsDown(&platform->pad);
     switch_av_handle_input(platform->media, buttons_down);

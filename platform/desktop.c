@@ -2,6 +2,7 @@
 #include <av/av_codecs.h>
 #include "../app/platform.h"
 #include "../app/sdl_display.h"
+#include "../app/controller.h"
 
 #include <SDL.h>
 
@@ -66,20 +67,6 @@ static bool find_local_ipv4(char *output, size_t output_size)
     return found;
 }
 
-static uint8_t axis_to_dsu(int32_t value)
-{
-    if (value < -32768)
-        value = -32768;
-    if (value > 32767)
-        value = 32767;
-    return (uint8_t)((value + 32768) * 255 / 65535);
-}
-
-static uint8_t trigger_to_dsu(int16_t value)
-{
-    return (uint8_t)((int32_t)value * 255 / 32767);
-}
-
 static bool controller_button(SDL_GameController *controller,
     SDL_GameControllerButton button)
 {
@@ -98,73 +85,59 @@ static SDL_GameController *open_controller(void)
     return NULL;
 }
 
-static void update_controller_state(DsuControllerState *state,
+static void update_controller_state(AppControllerInput *state,
     SDL_GameController *controller)
 {
-    memset(state, 0, sizeof(*state));
-    state->connected = true;
-    state->left_stick_x = 128;
-    state->left_stick_y = 128;
-    state->right_stick_x = 128;
-    state->right_stick_y = 128;
+    app_controller_neutral(state);
     if (!controller)
         return;
 
-    const bool first[8] = {
-        controller_button(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_DPAD_UP),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_START),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_RIGHTSTICK),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_LEFTSTICK),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_BACK),
+    const AppButton first[8] = {
+        APP_BUTTON_DPAD_LEFT, APP_BUTTON_DPAD_DOWN,
+        APP_BUTTON_DPAD_RIGHT, APP_BUTTON_DPAD_UP,
+        APP_BUTTON_OPTIONS, APP_BUTTON_STICK_R,
+        APP_BUTTON_STICK_L, APP_BUTTON_SHARE,
     };
-    const bool second[8] = {
-        controller_button(controller, SDL_CONTROLLER_BUTTON_X),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_A),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_B),
-        controller_button(controller, SDL_CONTROLLER_BUTTON_Y),
-        controller_button(controller,
-            SDL_CONTROLLER_BUTTON_RIGHTSHOULDER),
-        controller_button(controller,
-            SDL_CONTROLLER_BUTTON_LEFTSHOULDER),
-        false,
-        false,
+    const SDL_GameControllerButton first_sdl[8] = {
+        SDL_CONTROLLER_BUTTON_DPAD_LEFT, SDL_CONTROLLER_BUTTON_DPAD_DOWN,
+        SDL_CONTROLLER_BUTTON_DPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_UP,
+        SDL_CONTROLLER_BUTTON_START, SDL_CONTROLLER_BUTTON_RIGHTSTICK,
+        SDL_CONTROLLER_BUTTON_LEFTSTICK, SDL_CONTROLLER_BUTTON_BACK,
+    };
+    const AppButton second[8] = {
+        APP_BUTTON_Y, APP_BUTTON_B, APP_BUTTON_A, APP_BUTTON_X,
+        APP_BUTTON_R1, APP_BUTTON_L1, APP_BUTTON_R2, APP_BUTTON_L2,
+    };
+    const SDL_GameControllerButton second_sdl[8] = {
+        SDL_CONTROLLER_BUTTON_X, SDL_CONTROLLER_BUTTON_A,
+        SDL_CONTROLLER_BUTTON_B, SDL_CONTROLLER_BUTTON_Y,
+        SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+        SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SDL_CONTROLLER_BUTTON_INVALID,
+        SDL_CONTROLLER_BUTTON_INVALID,
     };
     for (unsigned i = 0; i < 8; ++i) {
-        if (first[i])
-            state->button_masks[0] |= (uint8_t)(0x80U >> i);
-        if (second[i])
-            state->button_masks[1] |= (uint8_t)(0x80U >> i);
+        if (first_sdl[i] != SDL_CONTROLLER_BUTTON_INVALID &&
+            controller_button(controller, first_sdl[i]))
+            state->buttons |= first[i];
+        if (second_sdl[i] != SDL_CONTROLLER_BUTTON_INVALID &&
+            controller_button(controller, second_sdl[i]))
+            state->buttons |= second[i];
     }
 
-    state->home_button =
+    state->home =
         controller_button(controller, SDL_CONTROLLER_BUTTON_GUIDE);
-    state->left_stick_x = axis_to_dsu(SDL_GameControllerGetAxis(controller,
-        SDL_CONTROLLER_AXIS_LEFTX));
-    state->left_stick_y = axis_to_dsu(-SDL_GameControllerGetAxis(
-        controller, SDL_CONTROLLER_AXIS_LEFTY));
-    state->right_stick_x = axis_to_dsu(SDL_GameControllerGetAxis(controller,
-        SDL_CONTROLLER_AXIS_RIGHTX));
-    state->right_stick_y = axis_to_dsu(-SDL_GameControllerGetAxis(
-        controller, SDL_CONTROLLER_AXIS_RIGHTY));
-
-    state->analog_buttons[0] = first[0] ? 255 : 0;
-    state->analog_buttons[1] = first[1] ? 255 : 0;
-    state->analog_buttons[2] = first[2] ? 255 : 0;
-    state->analog_buttons[3] = first[3] ? 255 : 0;
-    for (unsigned i = 0; i < 6; ++i)
-        state->analog_buttons[4 + i] = second[i] ? 255 : 0;
-    state->analog_buttons[10] = trigger_to_dsu(SDL_GameControllerGetAxis(
-        controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT));
-    state->analog_buttons[11] = trigger_to_dsu(SDL_GameControllerGetAxis(
-        controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT));
-
-    if (state->analog_buttons[10] > 0)
-        state->button_masks[1] |= 0x02;
-    if (state->analog_buttons[11] > 0)
-        state->button_masks[1] |= 0x01;
+    state->left_x = SDL_GameControllerGetAxis(controller,
+        SDL_CONTROLLER_AXIS_LEFTX);
+    state->left_y = -SDL_GameControllerGetAxis(
+        controller, SDL_CONTROLLER_AXIS_LEFTY);
+    state->right_x = SDL_GameControllerGetAxis(controller,
+        SDL_CONTROLLER_AXIS_RIGHTX);
+    state->right_y = -SDL_GameControllerGetAxis(
+        controller, SDL_CONTROLLER_AXIS_RIGHTY);
+    state->right_trigger = SDL_GameControllerGetAxis(
+        controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT);
+    state->left_trigger = SDL_GameControllerGetAxis(
+        controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
 }
 
 static bool av_session_start(void *context,
@@ -390,7 +363,7 @@ const char *app_platform_name(const AppPlatform *platform)
 }
 
 void app_platform_update_controller(AppPlatform *platform,
-    DsuControllerState *controller)
+    AppControllerInput *controller)
 {
     SDL_GameControllerUpdate();
     update_controller_state(controller, platform->controller);

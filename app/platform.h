@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <dsu/dsu_server.h>
+#include "controller.h"
 
 typedef struct AppPlatform AppPlatform;
 
@@ -20,7 +21,7 @@ const char *app_platform_ip_address(const AppPlatform *platform);
 const char *app_platform_name(const AppPlatform *platform);
 
 void app_platform_update_controller(AppPlatform *platform,
-    DsuControllerState *controller);
+    AppControllerInput *controller);
 const DsuAvCapabilities *app_platform_av_capabilities(
     const AppPlatform *platform);
 const DsuAvCallbacks *app_platform_av_callbacks(const AppPlatform *platform);

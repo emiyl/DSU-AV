@@ -1,4 +1,5 @@
 #include "platform.h"
+#include "controller.h"
 
 #include <stdio.h>
 
@@ -49,8 +50,10 @@ int main(int argc, char **argv)
         app_platform_name(platform));
 
     DsuControllerState controller = {0};
+    AppControllerInput raw_controller;
     while (app_platform_running(platform)) {
-        app_platform_update_controller(platform, &controller);
+        app_platform_update_controller(platform, &raw_controller);
+        app_controller_to_dsu(&raw_controller, &controller);
         dsu_server_poll(&server, &controller);
         app_platform_poll_media(platform);
         dsu_server_broadcast(&server, &controller);
