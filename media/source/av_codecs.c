@@ -263,7 +263,7 @@ static bool av_codecs_init_h264_encoder(AvCodecs *codecs)
     context->time_base = (AVRational){1, codecs->video_fps};
     context->framerate = (AVRational){codecs->video_fps, 1};
     context->bit_rate = (int64_t)codecs->video_bitrate_kbps * 1000;
-    context->gop_size = codecs->video_fps;
+    context->gop_size = codecs->video_fps * 2;
     context->max_b_frames = 0;
     context->flags |= AV_CODEC_FLAG_LOW_DELAY;
     context->thread_count = 1;
