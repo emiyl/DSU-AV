@@ -7,6 +7,10 @@
 
 #define MAX_OPUS_SAMPLES 2880
 #define AUDIO_RING_BYTES (48000 * 2 * sizeof(int16_t))
+#define DSU_VIDEO_WIDTH 640
+#define DSU_VIDEO_HEIGHT 360
+#define DSU_VIDEO_FPS 30
+#define DSU_VIDEO_BITRATE_KBPS 8000
 #ifdef __SWITCH__
 #define AUDIO_OUTPUT_SAMPLE_RATE 40960
 #else
@@ -272,10 +276,10 @@ AppAvPlayback *app_av_playback_create(SdlDisplay *display,
             (microphone_supported ? DSU_AV_CAP_MICROPHONE : 0),
         .video_codec = DSU_AV_CODEC_H264,
         .audio_codec = DSU_AV_CODEC_OPUS,
-        .video_width = 1280,
-        .video_height = 720,
-        .video_fps = 60,
-        .video_bitrate_kbps = 8000,
+        .video_width = DSU_VIDEO_WIDTH,
+        .video_height = DSU_VIDEO_HEIGHT,
+        .video_fps = DSU_VIDEO_FPS,
+        .video_bitrate_kbps = DSU_VIDEO_BITRATE_KBPS,
         .audio_sample_rate_div100 = 480,
         .audio_channels = 2,
         .audio_frame_duration_01ms = 100,
