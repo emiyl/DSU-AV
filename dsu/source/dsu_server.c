@@ -670,24 +670,36 @@ static void poll_av_media(DsuServer *server)
             sizeof(packet), 0, (struct sockaddr *)&source, &source_length);
         if (received < 0)
             break;
-        if (received < DSU_HEADER_SIZE + DSU_AV_MEDIA_HEADER_SIZE ||
-            source_length != sizeof(source) ||
-            !addresses_equal(&av->client_address, &source) ||
-            memcmp(packet, "DSUC", 4) != 0)
+        ++server->av_media_datagrams;
+        if (received < DSU_HEADER_SIZE + DSU_AV_MEDIA_HEADER_SIZE) {
+            ++server->av_media_bad_length;
             continue;
+        }
+        if (source_length != sizeof(source) ||
+            !addresses_equal(&av->client_address, &source) ||
+            memcmp(packet, "DSUC", 4) != 0) {
+            ++server->av_media_wrong_source;
+            continue;
+        }
 
         uint16_t declared_length = read_u16_le(packet + 6);
         if (declared_length < 4U + DSU_AV_MEDIA_HEADER_SIZE ||
             declared_length > DSU_MAX_PACKET_SIZE - 16 ||
-            (size_t)received < 16U + declared_length)
+            (size_t)received < 16U + declared_length) {
+            ++server->av_media_bad_length;
             continue;
+        }
         size_t packet_length = 16U + declared_length;
-        if (packet_crc32(packet, packet_length) != read_u32_le(packet + 8))
+        if (packet_crc32(packet, packet_length) != read_u32_le(packet + 8)) {
+            ++server->av_media_bad_crc;
             continue;
+        }
 
         const uint8_t *payload = packet + DSU_HEADER_SIZE;
-        if (read_u32_le(payload) != av->session_id)
+        if (read_u32_le(payload) != av->session_id) {
+            ++server->av_media_wrong_session;
             continue;
+        }
         uint16_t encoded_length = read_u16_le(payload + 26);
         if (encoded_length > av->settings.payload_limit ||
             packet_length != (size_t)DSU_HEADER_SIZE +
@@ -703,8 +715,14 @@ static void poll_av_media(DsuServer *server)
         uint8_t flags = payload[24];
         uint8_t codec = payload[25];
         const uint8_t *encoded = payload + DSU_AV_MEDIA_HEADER_SIZE;
-        if (fragment_count == 0 || fragment_index >= fragment_count)
+        if (fragment_count == 0 || fragment_index >= fragment_count) {
+            ++server->av_media_bad_length;
             continue;
+        }
+        if (type == DSU_AV_MSG_VIDEO)
+            ++server->av_media_video_type;
+        else if (type == DSU_AV_MSG_AUDIO)
+            ++server->av_media_audio_type;
 
         if (type == DSU_AV_MSG_VIDEO &&
             codec == av->settings.video_codec && av->video_frame) {
@@ -761,6 +779,8 @@ static void poll_av_media(DsuServer *server)
             av->callbacks.audio_packet(av->callback_context, sequence,
                 timestamp_us, media_id, flags, encoded, encoded_length);
         } else {
+            if (type == DSU_AV_MSG_AUDIO)
+                ++server->av_media_audio_rejected;
             continue;
         }
         av->last_activity_ms = clock_ms();

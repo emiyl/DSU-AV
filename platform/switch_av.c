@@ -147,6 +147,16 @@ static void receive_video(void *context, uint64_t timestamp_us, uint8_t flags,
 #endif
 }
 
+static void receive_audio(void *context, uint32_t sequence,
+    uint64_t timestamp_us, uint32_t packet_id, uint8_t flags,
+    const uint8_t *data, uint16_t length)
+{
+    SwitchAv *media = context;
+    app_av_playback_callbacks(media->playback)->audio_packet(
+        media->playback, sequence, timestamp_us, packet_id, flags,
+        data, length);
+}
+
 static bool session_start(void *context, const DsuAvSessionSettings *settings)
 {
     SwitchAv *media = context;
@@ -301,8 +311,7 @@ SwitchAv *switch_av_create(DsuServer *server, SdlDisplay *display)
         .session_start = session_start,
         .session_stop = session_stop,
         .video_frame = receive_video,
-        .audio_packet =
-            app_av_playback_callbacks(media->playback)->audio_packet,
+        .audio_packet = receive_audio,
     };
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
         app_av_playback_destroy(media->playback);

@@ -3,9 +3,12 @@
 #include <SDL.h>
 
 #include <stdlib.h>
+#include <string.h>
 
 #define MAX_OPUS_SAMPLES 2880
-#define AUDIO_QUEUE_LIMIT (48000 * 2 * 2 / 5)
+#define AUDIO_RING_BYTES (48000 * 2 * sizeof(int16_t))
+#define AUDIO_START_BYTES (48000 * 2 * sizeof(int16_t) / 10)
+#define AUDIO_STATS_INTERVAL_US 1000000ULL
 
 struct AppAvPlayback {
     AvCodecs *codecs;
@@ -16,8 +19,75 @@ struct AppAvPlayback {
     SdlDisplay *display;
     SDL_AudioDeviceID audio_device;
     int16_t pcm[MAX_OPUS_SAMPLES * 2];
+    uint8_t audio_ring[AUDIO_RING_BYTES];
+    uint32_t audio_read;
+    uint32_t audio_write;
+    uint32_t audio_available;
+    uint32_t audio_packets_decoded;
+    bool audio_playing;
+    uint64_t audio_packets_received;
+    uint64_t audio_encoded_bytes;
+    uint64_t audio_samples_decoded;
+    uint64_t audio_bytes_buffered;
+    uint64_t audio_callback_count;
+    uint64_t audio_callback_bytes;
+    uint64_t audio_underrun_bytes;
+    uint64_t next_audio_stats_us;
     bool active;
 };
+
+static void render_audio(void *context, uint8_t *output, int length)
+{
+    AppAvPlayback *playback = context;
+    uint32_t copied = (uint32_t)length;
+    if (copied > playback->audio_available)
+        copied = playback->audio_available;
+    for (uint32_t i = 0; i < copied; ++i) {
+        output[i] = playback->audio_ring[playback->audio_read];
+        playback->audio_read =
+            (playback->audio_read + 1) % AUDIO_RING_BYTES;
+    }
+    playback->audio_available -= copied;
+    ++playback->audio_callback_count;
+    playback->audio_callback_bytes += (uint64_t)copied;
+    if (copied < (uint32_t)length) {
+        playback->audio_underrun_bytes +=
+            (uint32_t)length - copied;
+        memset(output + copied, 0, (size_t)length - copied);
+    }
+}
+
+static void queue_audio(AppAvPlayback *playback, const uint8_t *data,
+    uint32_t length)
+{
+    if (length > AUDIO_RING_BYTES)
+        length = AUDIO_RING_BYTES;
+    SDL_LockAudioDevice(playback->audio_device);
+    if (length > AUDIO_RING_BYTES - playback->audio_available) {
+        uint32_t discard =
+            length - (AUDIO_RING_BYTES - playback->audio_available);
+        playback->audio_read = (playback->audio_read + discard) %
+            AUDIO_RING_BYTES;
+        playback->audio_available -= discard;
+    }
+    for (uint32_t i = 0; i < length; ++i) {
+        playback->audio_ring[playback->audio_write] = data[i];
+        playback->audio_write =
+            (playback->audio_write + 1) % AUDIO_RING_BYTES;
+    }
+    playback->audio_available += length;
+    playback->audio_bytes_buffered += length;
+    bool start = !playback->audio_playing &&
+        playback->audio_available >= AUDIO_START_BYTES;
+    if (start)
+        playback->audio_playing = true;
+    SDL_UnlockAudioDevice(playback->audio_device);
+    if (start) {
+        SDL_PauseAudioDevice(playback->audio_device, 0);
+        SDL_Log("Audio playback started after buffering %u bytes.",
+            (unsigned)AUDIO_START_BYTES);
+    }
+}
 
 static bool session_start(void *context,
     const DsuAvSessionSettings *settings)
@@ -34,12 +104,23 @@ static bool session_start(void *context,
             playback->video_backend.context, settings))
         goto fail;
 
-    if (settings->audio_codec != DSU_AV_CODEC_NONE) {
+    if (settings->audio_codec != DSU_AV_CODEC_NONE &&
+        playback->video_backend.audio_start &&
+        !playback->video_backend.audio_start(
+            playback->video_backend.context, settings)) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
+            "Optional audio backend failed; continuing without sound.");
+    }
+
+    if (settings->audio_codec != DSU_AV_CODEC_NONE &&
+        !playback->video_backend.audio_start) {
         SDL_AudioSpec desired = {
             .freq = settings->audio_sample_rate_div100 * 100,
             .format = AUDIO_S16SYS,
             .channels = settings->audio_channels,
             .samples = 256,
+            .callback = render_audio,
+            .userdata = playback,
         };
         SDL_AudioSpec obtained;
         playback->audio_device = SDL_OpenAudioDevice(
@@ -57,7 +138,26 @@ static bool session_start(void *context,
         SDL_Log("Audio output opened: %d Hz, %u channels, %u samples",
             obtained.freq, (unsigned)obtained.channels,
             (unsigned)obtained.samples);
-        SDL_PauseAudioDevice(playback->audio_device, 0);
+        SDL_Log("Audio driver '%s'; %d compiled drivers, device state %d.",
+            SDL_GetCurrentAudioDriver() ?
+                SDL_GetCurrentAudioDriver() : "none",
+            SDL_GetNumAudioDrivers(),
+            (int)SDL_GetAudioDeviceStatus(playback->audio_device));
+        playback->audio_read = 0;
+        playback->audio_write = 0;
+        playback->audio_available = 0;
+        playback->audio_packets_decoded = 0;
+        playback->audio_playing = false;
+        playback->audio_packets_received = 0;
+        playback->audio_encoded_bytes = 0;
+        playback->audio_samples_decoded = 0;
+        playback->audio_bytes_buffered = 0;
+        playback->audio_callback_count = 0;
+        playback->audio_callback_bytes = 0;
+        playback->audio_underrun_bytes = 0;
+        playback->next_audio_stats_us =
+            av_codecs_monotonic_us() + AUDIO_STATS_INTERVAL_US;
+        SDL_PauseAudioDevice(playback->audio_device, 1);
     }
     playback->active = true;
     SDL_Log("DSU-AV session started: %ux%u @ %u FPS",
@@ -69,9 +169,12 @@ fail:
     if (playback->video_backend.video_stop)
         playback->video_backend.video_stop(playback->video_backend.context);
     if (playback->audio_device) {
+        SDL_PauseAudioDevice(playback->audio_device, 1);
         SDL_CloseAudioDevice(playback->audio_device);
         playback->audio_device = 0;
     }
+    if (playback->video_backend.audio_stop)
+        playback->video_backend.audio_stop(playback->video_backend.context);
     av_codecs_destroy(playback->codecs);
     playback->codecs = NULL;
     return false;
@@ -115,7 +218,13 @@ static void audio_packet(void *context, uint32_t sequence,
     (void)timestamp_us;
     (void)packet_id;
     AppAvPlayback *playback = context;
-    if (!playback->audio_device) {
+    ++playback->audio_packets_received;
+    playback->audio_encoded_bytes += length;
+    if (playback->audio_packets_received == 1)
+        SDL_Log("First DSU audio packet received: sequence %u, %u bytes, "
+            "flags 0x%02x.", sequence, (unsigned)length, (unsigned)flags);
+    if (!playback->audio_device &&
+        !playback->video_backend.audio_submit) {
         SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
             "Received audio before an output device was available.");
         return;
@@ -128,19 +237,21 @@ static void audio_packet(void *context, uint32_t sequence,
             (unsigned)length);
         return;
     }
-    if ((uint32_t)SDL_GetQueuedAudioSize(playback->audio_device) >
-        AUDIO_QUEUE_LIMIT)
-        SDL_ClearQueuedAudio(playback->audio_device);
-    if (SDL_QueueAudio(playback->audio_device, playback->pcm,
-        (Uint32)(samples * playback->settings.audio_channels *
-            sizeof(int16_t))) < 0) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
-            "Could not queue decoded audio: %s", SDL_GetError());
-        return;
+    playback->audio_samples_decoded += (uint64_t)samples;
+    if (playback->video_backend.audio_submit) {
+        if (!playback->video_backend.audio_submit(
+                playback->video_backend.context, playback->pcm,
+                (uint32_t)samples,
+                playback->settings.audio_channels)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
+                "Switch audio backend could not submit decoded PCM.");
+        }
+    } else {
+        queue_audio(playback, (const uint8_t *)playback->pcm,
+            (uint32_t)(samples * playback->settings.audio_channels *
+                sizeof(int16_t)));
     }
-    if (SDL_GetAudioDeviceStatus(playback->audio_device) !=
-            SDL_AUDIO_PLAYING)
-        SDL_PauseAudioDevice(playback->audio_device, 0);
+    ++playback->audio_packets_decoded;
 }
 
 static void render_video_frame(void *context, const AvDecodedFrame *frame)
@@ -216,6 +327,25 @@ void app_av_playback_poll(AppAvPlayback *playback)
 {
     if (!playback || !playback->active)
         return;
+    uint64_t now_us = av_codecs_monotonic_us();
+    if (now_us >= playback->next_audio_stats_us) {
+        uint32_t available = playback->audio_available;
+        int device_state = playback->audio_device ?
+            (int)SDL_GetAudioDeviceStatus(playback->audio_device) : -1;
+        SDL_Log("Audio stats: packets=%llu encoded=%llu decoded_samples=%llu "
+            "buffered=%llu callbacks=%llu callback_bytes=%llu "
+            "underrun=%llu ring=%u state=%d playing=%d.",
+            (unsigned long long)playback->audio_packets_received,
+            (unsigned long long)playback->audio_encoded_bytes,
+            (unsigned long long)playback->audio_samples_decoded,
+            (unsigned long long)playback->audio_bytes_buffered,
+            (unsigned long long)playback->audio_callback_count,
+            (unsigned long long)playback->audio_callback_bytes,
+            (unsigned long long)playback->audio_underrun_bytes,
+            (unsigned)available, device_state, playback->audio_playing);
+        playback->next_audio_stats_us =
+            now_us + AUDIO_STATS_INTERVAL_US;
+    }
     if (playback->video_backend.video_poll)
         playback->video_backend.video_poll(playback->video_backend.context,
             render_video_frame, playback);

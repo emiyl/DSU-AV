@@ -39,6 +39,7 @@ if(NOT NINTENDO_SWITCH)
         app/controller.c
         app/microphone.c
         app/hold.c
+        app/logging.c
         platform/desktop.c
     )
     target_link_libraries(dsu-controller
@@ -80,6 +81,7 @@ add_executable(${DSU_SWITCH_TARGET}
     app/controller.c
     app/microphone.c
     app/hold.c
+    app/logging.c
     platform/switch.c
     platform/switch_av.c
 )

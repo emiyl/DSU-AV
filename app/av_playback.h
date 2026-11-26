@@ -19,6 +19,11 @@ typedef struct {
         uint32_t length, uint64_t timestamp_us);
     void (*video_poll)(void *context, AvDecodedFrameCallback callback,
         void *callback_context);
+    bool (*audio_start)(void *context,
+        const DsuAvSessionSettings *settings);
+    void (*audio_stop)(void *context);
+    bool (*audio_submit)(void *context, const int16_t *samples,
+        uint32_t sample_count, uint8_t channels);
 } AppAvVideoBackend;
 
 AppAvPlayback *app_av_playback_create(SdlDisplay *display,

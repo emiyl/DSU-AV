@@ -112,6 +112,14 @@ typedef struct {
     uint32_t subscriptions;
     char last_client[48];
     void *av_internal;
+    uint32_t av_media_datagrams;
+    uint32_t av_media_wrong_source;
+    uint32_t av_media_bad_length;
+    uint32_t av_media_bad_crc;
+    uint32_t av_media_wrong_session;
+    uint32_t av_media_video_type;
+    uint32_t av_media_audio_type;
+    uint32_t av_media_audio_rejected;
 } DsuServer;
 
 bool dsu_server_init(DsuServer *server, const DsuServerConfig *config);
