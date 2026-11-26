@@ -18,6 +18,7 @@ struct SdlDisplay {
     SDL_Texture *video_texture;
     int video_width;
     int video_height;
+    Uint32 video_format;
     bool has_video;
     bool running;
     DsuTouchPoint touch[2];
@@ -113,8 +114,31 @@ void sdl_display_frame(SdlDisplay *display, AvCodecs *codecs,
 {
     if (!display || !frame)
         return;
+    if (frame->format == AV_PIX_FMT_NV12) {
+        if (display->video_width != frame->width ||
+            display->video_height != frame->height ||
+            display->video_format != SDL_PIXELFORMAT_NV12 ||
+            !display->video_texture) {
+            SDL_DestroyTexture(display->video_texture);
+            display->video_texture = SDL_CreateTexture(display->renderer,
+                SDL_PIXELFORMAT_NV12, SDL_TEXTUREACCESS_STREAMING,
+                frame->width, frame->height);
+            display->video_width = frame->width;
+            display->video_height = frame->height;
+            display->video_format = SDL_PIXELFORMAT_NV12;
+        }
+        if (!display->video_texture)
+            return;
+        if (SDL_UpdateNVTexture(display->video_texture, NULL,
+                frame->planes[0], frame->strides[0],
+                frame->planes[1], frame->strides[1]) < 0)
+            return;
+        display->has_video = true;
+        return;
+    }
     if (display->video_width != frame->width ||
         display->video_height != frame->height ||
+        display->video_format != SDL_PIXELFORMAT_ABGR8888 ||
         !display->video_texture) {
         SDL_DestroyTexture(display->video_texture);
         display->video_texture = SDL_CreateTexture(display->renderer,
@@ -122,6 +146,7 @@ void sdl_display_frame(SdlDisplay *display, AvCodecs *codecs,
             frame->width, frame->height);
         display->video_width = frame->width;
         display->video_height = frame->height;
+        display->video_format = SDL_PIXELFORMAT_ABGR8888;
     }
     if (!display->video_texture)
         return;
@@ -229,6 +254,7 @@ void sdl_display_clear_video(SdlDisplay *display)
     display->video_texture = NULL;
     display->video_width = 0;
     display->video_height = 0;
+    display->video_format = 0;
     display->has_video = false;
 }
 
