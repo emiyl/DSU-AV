@@ -140,6 +140,8 @@ void dsu_server_broadcast(DsuServer *server, const DsuControllerState *state);
 void dsu_server_expire_clients(DsuServer *server);
 bool dsu_server_av_is_active(const DsuServer *server);
 const DsuAvSessionSettings *dsu_server_av_settings(const DsuServer *server);
+bool dsu_server_av_get_quality(DsuServer *server,
+    DsuAvQualityFeedback *feedback);
 bool dsu_server_av_send_microphone(DsuServer *server, uint64_t timestamp_us,
     uint8_t flags, const uint8_t *data, uint16_t length);
 void dsu_server_av_set_microphone_state(DsuServer *server, uint8_t state,

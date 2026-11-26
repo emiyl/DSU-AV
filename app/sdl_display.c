@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define DISPLAY_WIDTH 1280
 #define DISPLAY_HEIGHT 720
@@ -22,6 +23,9 @@ struct SdlDisplay {
     bool has_video;
     bool running;
     DsuTouchPoint touch[2];
+    SdlVideoDiagnostics video_diagnostics;
+    uint64_t video_present_start_us;
+    uint64_t last_present_us;
 };
 
 static const uint8_t font_5x7[][7] = {
@@ -70,6 +74,14 @@ static const uint8_t font_5x7[][7] = {
     ['Y'] = {17, 17, 10, 4, 4, 4, 4},
     ['Z'] = {31, 1, 2, 4, 8, 16, 31},
 };
+
+static uint64_t clock_us(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000ULL +
+        (uint64_t)now.tv_nsec / 1000ULL;
+}
 
 SdlDisplay *sdl_display_create(void)
 {
@@ -129,10 +141,13 @@ void sdl_display_frame(SdlDisplay *display, AvCodecs *codecs,
         }
         if (!display->video_texture)
             return;
+        uint64_t upload_start_us = clock_us();
         if (SDL_UpdateNVTexture(display->video_texture, NULL,
                 frame->planes[0], frame->strides[0],
                 frame->planes[1], frame->strides[1]) < 0)
             return;
+        display->video_diagnostics.uploaded_us =
+            clock_us() - upload_start_us;
         display->has_video = true;
         return;
     }
@@ -187,6 +202,53 @@ static void draw_text(SDL_Renderer *renderer, int x, int y,
     }
 }
 
+void sdl_display_set_video_diagnostics(SdlDisplay *display,
+    const SdlVideoDiagnostics *diagnostics)
+{
+    if (!display || !diagnostics)
+        return;
+    display->video_diagnostics.submitted_us = diagnostics->submitted_us;
+    display->video_diagnostics.decoded_us = diagnostics->decoded_us;
+    display->video_diagnostics.callback_us = diagnostics->callback_us;
+    display->video_diagnostics.frame_gap_us = diagnostics->frame_gap_us;
+    display->video_diagnostics.frames = diagnostics->frames;
+    display->video_diagnostics.keyframes = diagnostics->keyframes;
+    display->video_diagnostics.video_packets = diagnostics->video_packets;
+    display->video_diagnostics.video_lost = diagnostics->video_lost;
+}
+
+static void draw_video_diagnostics(SdlDisplay *display)
+{
+    const SdlVideoDiagnostics *timings = &display->video_diagnostics;
+    char lines[10][160];
+    snprintf(lines[0], sizeof(lines[0]), "DSU-AV LATENCY DIAGNOSTICS");
+    snprintf(lines[1], sizeof(lines[1]), "FRAME GAP  %6" PRIu64 " us",
+        timings->frame_gap_us);
+    snprintf(lines[2], sizeof(lines[2]), "SUBMIT     %6" PRIu64 " us",
+        timings->submitted_us);
+    snprintf(lines[3], sizeof(lines[3]), "DECODE     %6" PRIu64 " us",
+        timings->decoded_us);
+    snprintf(lines[4], sizeof(lines[4]), "NV12 UPLOAD%6" PRIu64 " us",
+        timings->uploaded_us);
+    snprintf(lines[5], sizeof(lines[5]), "PRESENT    %6" PRIu64 " us",
+        timings->presented_us);
+    snprintf(lines[6], sizeof(lines[6]), "RECEIVE    %6" PRIu64 " us",
+        timings->callback_us);
+    snprintf(lines[7], sizeof(lines[7]), "FRAMES     %6" PRIu32,
+        timings->frames);
+    snprintf(lines[8], sizeof(lines[8]), "KEYFRAMES  %6" PRIu32,
+        timings->keyframes);
+    snprintf(lines[9], sizeof(lines[9]), "VIDEO      %6" PRIu32 " PACK / %4" PRIu32 " LOST",
+        timings->video_packets, timings->video_lost);
+
+    SDL_SetRenderDrawBlendMode(display->renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(display->renderer, 8, 10, 14, 210);
+    SDL_Rect panel = {24, 24, 820, 390};
+    SDL_RenderFillRect(display->renderer, &panel);
+    for (unsigned i = 0; i < 10; ++i)
+        draw_text(display->renderer, 42, 42 + (int)i * 34, lines[i]);
+}
+
 void sdl_display_status(SdlDisplay *display, const DsuServer *server,
     const DsuControllerState *controller, const char *platform_name,
     const char *ip_address, uint64_t raw_buttons,
@@ -205,7 +267,18 @@ void sdl_display_status(SdlDisplay *display, const DsuServer *server,
         if (display->has_video)
             SDL_RenderCopy(display->renderer, display->video_texture,
                 NULL, NULL);
+        draw_video_diagnostics(display);
+        uint32_t fps = av_settings->video_fps ? av_settings->video_fps : 30;
+        uint64_t present_interval_us = 1000000ULL / fps;
+        uint64_t now_us = clock_us();
+        if (display->last_present_us &&
+            now_us - display->last_present_us < present_interval_us)
+            return;
+        uint64_t present_start_us = clock_us();
         SDL_RenderPresent(display->renderer);
+        display->video_diagnostics.presented_us =
+            clock_us() - present_start_us;
+        display->last_present_us = now_us;
         return;
     }
 
@@ -256,6 +329,7 @@ void sdl_display_clear_video(SdlDisplay *display)
     display->video_height = 0;
     display->video_format = 0;
     display->has_video = false;
+    display->last_present_us = 0;
 }
 
 bool sdl_display_process_events(SdlDisplay *display)

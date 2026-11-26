@@ -247,6 +247,9 @@ bool dsu_server_init(DsuServer *server, const DsuServerConfig *config)
         close(fd);
         return false;
     }
+    int receive_buffer = 1024 * 1024;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+        &receive_buffer, sizeof(receive_buffer));
 
     struct sockaddr_in bind_address = {
         .sin_family = AF_INET,
@@ -436,6 +439,9 @@ static bool open_av_media_socket(DsuAvInternal *av)
         close(fd);
         return false;
     }
+    int receive_buffer = 1024 * 1024;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+        &receive_buffer, sizeof(receive_buffer));
 
     struct sockaddr_in address = {
         .sin_family = AF_INET,
@@ -930,6 +936,25 @@ const DsuAvSessionSettings *dsu_server_av_settings(const DsuServer *server)
 {
     DsuAvInternal *av = av_internal(server);
     return av && av->active ? &av->settings : NULL;
+}
+
+bool dsu_server_av_get_quality(DsuServer *server,
+    DsuAvQualityFeedback *feedback)
+{
+    if (!feedback)
+        return false;
+    DsuAvInternal *av = av_internal(server);
+    if (!av || !av->active) {
+        memset(feedback, 0, sizeof(*feedback));
+        return false;
+    }
+    *feedback = (DsuAvQualityFeedback){
+        .video_packets = av->video_packets,
+        .video_lost = av->video_lost,
+        .audio_packets = av->audio_packets,
+        .audio_lost = av->audio_lost,
+    };
+    return true;
 }
 
 bool dsu_server_av_send_microphone(DsuServer *server, uint64_t timestamp_us,

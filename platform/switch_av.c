@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <SDL2/SDL.h>
 #include <switch.h>
@@ -20,6 +21,7 @@
 #define MAX_ENCODED_FRAME (1024 * 1024)
 #define MAX_OPUS_SAMPLES 2880
 #define MICROPHONE_QUEUE_LIMIT (48000 * 2 / 5)
+#define DECODER_SUBMIT_TIMEOUT_NS (10ULL * 1000000ULL)
 
 struct SwitchAv {
     DsuServer *server;
@@ -38,12 +40,67 @@ struct SwitchAv {
     uint8_t codec_config[8192];
     uint32_t codec_config_size;
 #endif
+    uint64_t submitted_us;
+    uint64_t decoded_us;
+    uint64_t callback_us;
+    uint64_t frame_gap_us;
+    uint64_t last_frame_us;
+    uint32_t frames;
+    uint32_t keyframes;
 };
 
+static uint64_t switch_av_clock_us(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000ULL +
+        (uint64_t)now.tv_nsec / 1000ULL;
+}
+
 #ifdef __SWITCH2__
+static bool drain_hardware_frames(SwitchAv *media)
+{
+    VideoFrame frame;
+    VideoFrame latest_frame = {0};
+    bool has_latest_frame = false;
+    uint64_t decode_start_us = switch_av_clock_us();
+
+    while (R_SUCCEEDED(videoDecoderGetFrame(&media->decoder, &frame, 0))) {
+        if (has_latest_frame)
+            videoDecoderReleaseFrame(&media->decoder, &latest_frame);
+        latest_frame = frame;
+        has_latest_frame = true;
+    }
+    media->decoded_us = switch_av_clock_us() - decode_start_us;
+
+    if (!has_latest_frame)
+        return false;
+    uint64_t now_us = switch_av_clock_us();
+    if (media->last_frame_us)
+        media->frame_gap_us = now_us - media->last_frame_us;
+    media->last_frame_us = now_us;
+    ++media->frames;
+
+    AvDecodedFrame decoded = {
+        .timestamp_us = (uint64_t)latest_frame.timestamp_ns / 1000,
+        .planes = (const uint8_t *const[]){latest_frame.planes[0],
+            latest_frame.planes[1], NULL, NULL},
+        .strides = (const int[]){(int)latest_frame.pitches[0],
+            (int)latest_frame.pitches[1], 0, 0},
+        .format = AV_PIX_FMT_NV12,
+        .width = (int)latest_frame.width,
+        .height = (int)latest_frame.height,
+    };
+    sdl_display_frame(media->display,
+        app_av_playback_codecs(media->playback), &decoded);
+    videoDecoderReleaseFrame(&media->decoder, &latest_frame);
+    return true;
+}
+
 static bool decode_hardware_video(SwitchAv *media, const uint8_t *data,
     uint32_t length, uint64_t timestamp_us)
 {
+    (void)timestamp_us;
     if (!media->decoder_created) {
         if (!av_codecs_extract_h264_config(data, length, media->codec_config,
                 sizeof(media->codec_config), &media->codec_config_size))
@@ -65,6 +122,7 @@ static bool decode_hardware_video(SwitchAv *media, const uint8_t *data,
             .width = app_av_playback_settings(media->playback)->video_width,
             .height = app_av_playback_settings(media->playback)->video_height,
             .frame_rate = app_av_playback_settings(media->playback)->video_fps,
+            .image_count = 2,
             .tiling = ViddecTilingMode_PitchLinear,
             .max_sample_size = MAX_ENCODED_FRAME,
             .codec_config = media->codec_config,
@@ -75,28 +133,16 @@ static bool decode_hardware_video(SwitchAv *media, const uint8_t *data,
         media->decoder_created = true;
     }
 
-    if (R_FAILED(videoDecoderSubmit(&media->decoder, data, length,
-            (s64)timestamp_us * 1000, false, 0))) {
-        dsu_server_av_request_keyframe(media->server, 0, 1, 2);
+    drain_hardware_frames(media);
+
+    uint64_t submit_start_us = switch_av_clock_us();
+    Result submit_result = videoDecoderSubmit(&media->decoder, data, length,
+        0, false, DECODER_SUBMIT_TIMEOUT_NS);
+    media->submitted_us = switch_av_clock_us() - submit_start_us;
+    if (R_FAILED(submit_result)) {
         return false;
     }
-
-    VideoFrame frame;
-    while (R_SUCCEEDED(videoDecoderGetFrame(&media->decoder, &frame, 0))) {
-        AvDecodedFrame decoded = {
-            .timestamp_us = (uint64_t)frame.timestamp_ns / 1000,
-            .planes = (const uint8_t *const[]){frame.planes[0],
-                frame.planes[1], NULL, NULL},
-            .strides = (const int[]){(int)frame.pitches[0],
-                (int)frame.pitches[1], 0, 0},
-            .format = AV_PIX_FMT_NV12,
-            .width = (int)frame.width,
-            .height = (int)frame.height,
-        };
-        sdl_display_frame(media->display,
-            app_av_playback_codecs(media->playback), &decoded);
-        videoDecoderReleaseFrame(&media->decoder, &frame);
-    }
+    drain_hardware_frames(media);
     return true;
 }
 
@@ -106,10 +152,7 @@ static bool hardware_video_submit(void *context, const uint8_t *data,
     SwitchAv *media = context;
     if (length > MAX_ENCODED_FRAME)
         return false;
-    bool accepted = decode_hardware_video(media, data, length, timestamp_us);
-    if (!accepted)
-        dsu_server_av_request_keyframe(media->server, 0, 1, 2);
-    return accepted;
+    return decode_hardware_video(media, data, length, timestamp_us);
 }
 #endif
 
@@ -135,6 +178,8 @@ static void receive_video(void *context, uint64_t timestamp_us, uint8_t flags,
     const uint8_t *data, uint32_t length)
 {
     SwitchAv *media = context;
+    uint64_t callback_start_us = switch_av_clock_us();
+    (void)timestamp_us;
 #ifdef __SWITCH2__
     (void)flags;
     app_av_playback_callbacks(media->playback)->video_frame(
@@ -145,6 +190,8 @@ static void receive_video(void *context, uint64_t timestamp_us, uint8_t flags,
             data, length, timestamp_us))
         dsu_server_av_request_keyframe(media->server, 0, 1, 2);
 #endif
+    media->callback_us =
+        switch_av_clock_us() - callback_start_us;
 }
 
 static void receive_audio(void *context, uint32_t sequence,
@@ -240,6 +287,23 @@ void switch_av_poll(SwitchAv *media)
 {
     if (!media || !media->active)
         return;
+#ifdef __SWITCH2__
+    if (media->decoder_created)
+        drain_hardware_frames(media);
+#endif
+    DsuAvQualityFeedback quality = {0};
+    dsu_server_av_get_quality(media->server, &quality);
+    SdlVideoDiagnostics diagnostics = {
+        .submitted_us = media->submitted_us,
+        .decoded_us = media->decoded_us,
+        .frame_gap_us = media->frame_gap_us,
+        .callback_us = media->callback_us,
+        .frames = media->frames,
+        .keyframes = media->keyframes,
+        .video_packets = quality.video_packets,
+        .video_lost = quality.video_lost,
+    };
+    sdl_display_set_video_diagnostics(media->display, &diagnostics);
     app_av_playback_poll(media->playback);
     if (media->microphone.state == APP_MIC_AWAITING_CONSENT)
         start_microphone(media);
