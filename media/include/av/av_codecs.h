@@ -36,6 +36,9 @@ bool av_codecs_extract_h264_config(const uint8_t *data, uint32_t length,
 int av_codecs_encode_rgba(AvCodecs *codecs, const uint8_t *rgba,
     int stride, uint64_t timestamp_us, bool force_keyframe,
     bool *is_keyframe, uint8_t *data, int capacity);
+int av_codecs_encode_rgba_scaled(AvCodecs *codecs, const uint8_t *rgb,
+    int source_width, int source_height, int stride, uint64_t timestamp_us,
+    bool force_keyframe, bool *is_keyframe, uint8_t *data, int capacity);
 
 int av_codecs_decode_opus(AvCodecs *codecs, const uint8_t *data,
     uint16_t length, bool reset, int16_t *pcm, int pcm_capacity);

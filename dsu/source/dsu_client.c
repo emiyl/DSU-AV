@@ -179,7 +179,7 @@ static void pause_video_fragment(void)
 {
     struct timespec delay = {
         .tv_sec = 0,
-        .tv_nsec = 250000,
+        .tv_nsec = 50000,
     };
     nanosleep(&delay, NULL);
 }

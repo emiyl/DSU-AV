@@ -27,6 +27,9 @@ struct AvCodecs {
     OpusEncoder *opus_microphone_encoder;
     struct SwsContext *scaler;
     struct SwsContext *encoder_scaler;
+    int encoder_source_width;
+    int encoder_source_height;
+    int encoder_source_stride;
     enum AVPixelFormat scaler_format;
     int scaler_width;
     int scaler_height;
@@ -254,12 +257,15 @@ static bool av_codecs_init_h264_encoder(AvCodecs *codecs)
     context->time_base = (AVRational){1, codecs->video_fps};
     context->framerate = (AVRational){codecs->video_fps, 1};
     context->bit_rate = (int64_t)codecs->video_bitrate_kbps * 1000;
-    context->gop_size = codecs->video_fps * 2;
+    context->gop_size = codecs->video_fps;
     context->max_b_frames = 0;
     context->flags |= AV_CODEC_FLAG_LOW_DELAY;
     context->thread_count = 1;
     av_opt_set(context->priv_data, "preset", "ultrafast", 0);
     av_opt_set(context->priv_data, "tune", "zerolatency", 0);
+    av_opt_set(context->priv_data, "rc-lookahead", "0", 0);
+    av_opt_set_int(context->priv_data, "bframes", 0, 0);
+    av_opt_set_int(context->priv_data, "repeat-headers", 1, 0);
     if (avcodec_open2(context, codec, NULL) < 0)
         goto fail;
 
@@ -282,40 +288,52 @@ fail:
 }
 #endif
 
-int av_codecs_encode_rgba(AvCodecs *codecs, const uint8_t *rgba, int stride,
-    uint64_t timestamp_us, bool force_keyframe, bool *is_keyframe,
-    uint8_t *data, int capacity)
+static int av_codecs_encode_internal(AvCodecs *codecs, const uint8_t *rgb,
+    int source_width, int source_height, int stride, uint64_t timestamp_us,
+    bool force_keyframe, bool *is_keyframe, uint8_t *data, int capacity,
+    enum AVPixelFormat source_format)
 {
 #ifndef AV_CODECS_SOFTWARE_H264
     (void)codecs;
-    (void)rgba;
+    (void)rgb;
+    (void)source_width;
+    (void)source_height;
     (void)stride;
     (void)timestamp_us;
     (void)force_keyframe;
     (void)is_keyframe;
     (void)data;
     (void)capacity;
+    (void)source_format;
     return 0;
 #else
-    if (!codecs || !rgba || !data || capacity <= 0 || stride <= 0 ||
+    if (!codecs || !rgb || !data || capacity <= 0 || stride <= 0 ||
+        source_width <= 0 || source_height <= 0 ||
         !av_codecs_init_h264_encoder(codecs))
         return 0;
     AVFrame *frame = codecs->h264_encoder_frame;
     if (av_frame_make_writable(frame) < 0)
         return 0;
 
-    if (!codecs->encoder_scaler) {
-        codecs->encoder_scaler = sws_getContext(frame->width, frame->height,
-            AV_PIX_FMT_RGBA, frame->width, frame->height,
+    if (!codecs->encoder_scaler ||
+        codecs->encoder_source_width != source_width ||
+        codecs->encoder_source_height != source_height ||
+        codecs->encoder_source_stride != stride) {
+        sws_freeContext(codecs->encoder_scaler);
+        codecs->encoder_scaler = sws_getContext(source_width, source_height,
+            source_format, frame->width, frame->height,
             (enum AVPixelFormat)frame->format, SWS_BILINEAR,
             NULL, NULL, NULL);
+        codecs->encoder_source_width = source_width;
+        codecs->encoder_source_height = source_height;
+        codecs->encoder_source_stride = stride;
     }
     if (!codecs->encoder_scaler)
         return 0;
-    const uint8_t *source[] = {rgba, NULL, NULL, NULL};
+    const uint8_t *source[] = {rgb, NULL, NULL, NULL};
     int source_stride[] = {stride, 0, 0, 0};
     if (sws_scale(codecs->encoder_scaler, source, source_stride, 0,
-            frame->height, frame->data, frame->linesize) != frame->height)
+            source_height, frame->data, frame->linesize) != frame->height)
         return 0;
 
     frame->pts = (int64_t)(timestamp_us * (uint64_t)codecs->video_fps /
@@ -343,6 +361,26 @@ int av_codecs_encode_rgba(AvCodecs *codecs, const uint8_t *rgba, int stride,
         *is_keyframe = (packet->flags & AV_PKT_FLAG_KEY) != 0;
     return packet->size;
 #endif
+}
+
+int av_codecs_encode_rgba_scaled(AvCodecs *codecs, const uint8_t *rgb,
+    int source_width, int source_height, int stride, uint64_t timestamp_us,
+    bool force_keyframe, bool *is_keyframe, uint8_t *data, int capacity)
+{
+    return av_codecs_encode_internal(codecs, rgb, source_width, source_height,
+        stride, timestamp_us, force_keyframe, is_keyframe, data, capacity,
+        AV_PIX_FMT_RGB24);
+}
+
+int av_codecs_encode_rgba(AvCodecs *codecs, const uint8_t *rgba, int stride,
+    uint64_t timestamp_us, bool force_keyframe, bool *is_keyframe,
+    uint8_t *data, int capacity)
+{
+    if (!codecs)
+        return 0;
+    return av_codecs_encode_internal(codecs, rgba,
+        codecs->video_width, codecs->video_height, stride, timestamp_us,
+        force_keyframe, is_keyframe, data, capacity, AV_PIX_FMT_RGBA);
 }
 
 int av_codecs_decode_opus(AvCodecs *codecs, const uint8_t *data,
