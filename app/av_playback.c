@@ -84,7 +84,7 @@ static void queue_audio(AppAvPlayback *playback, const uint8_t *data,
     playback->audio_available += length;
     playback->audio_bytes_buffered += length;
     uint32_t start_bytes = playback->audio_output_sample_rate *
-        playback->settings.audio_channels * sizeof(int16_t) / 10;
+        playback->settings.audio_channels * sizeof(int16_t) / 4;
     bool start = !playback->audio_playing &&
         playback->audio_available >= start_bytes;
     if (start)
@@ -92,8 +92,8 @@ static void queue_audio(AppAvPlayback *playback, const uint8_t *data,
     SDL_UnlockAudioDevice(playback->audio_device);
     if (start) {
         SDL_PauseAudioDevice(playback->audio_device, 0);
-        SDL_Log("Audio playback started after buffering %u bytes.",
-            (unsigned)start_bytes);
+        SDL_Log("Audio playback started after buffering %u bytes "
+            "(250 ms).", (unsigned)start_bytes);
     }
 }
 
@@ -266,12 +266,19 @@ static void audio_packet(void *context, uint32_t sequence,
             int source = (int)playback->audio_resample_position;
             if (source >= samples)
                 source = samples - 1;
+            int next_source = source + 1 < samples ?
+                source + 1 : source;
+            double fraction = playback->audio_resample_position - source;
             for (int channel = 0;
                 channel < playback->settings.audio_channels; ++channel) {
-                playback->pcm[sample *
-                    playback->settings.audio_channels + channel] =
-                    ((const int16_t *)playback->pcm)[source *
-                        playback->settings.audio_channels + channel];
+                int current_index =
+                    sample * playback->settings.audio_channels + channel;
+                int16_t first = ((const int16_t *)playback->pcm)[source *
+                    playback->settings.audio_channels + channel];
+                int16_t second = ((const int16_t *)playback->pcm)[next_source *
+                    playback->settings.audio_channels + channel];
+                playback->pcm[current_index] = (int16_t)(
+                    (double)first + ((double)second - first) * fraction);
             }
             playback->audio_resample_position += ratio;
         }
