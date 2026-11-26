@@ -2,8 +2,19 @@
 #include "controller.h"
 
 #include <stdio.h>
+#include <time.h>
 
 #include <dsu/dsu_server.h>
+
+#define CONTROLLER_BROADCAST_INTERVAL_MS 10ULL
+
+static uint64_t monotonic_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000ULL +
+        (uint64_t)now.tv_nsec / 1000000ULL;
+}
 
 int main(int argc, char **argv)
 {
@@ -47,12 +58,18 @@ int main(int argc, char **argv)
 
     DsuControllerState controller = {0};
     AppControllerInput raw_controller;
+    uint64_t next_broadcast_ms = monotonic_ms();
     while (app_platform_running(platform)) {
         app_platform_update_controller(platform, &raw_controller);
         app_controller_to_dsu(&raw_controller, &controller);
         dsu_server_poll(&server, &controller);
         app_platform_poll_media(platform);
-        dsu_server_broadcast(&server, &controller);
+        uint64_t now_ms = monotonic_ms();
+        if (now_ms >= next_broadcast_ms) {
+            dsu_server_broadcast(&server, &controller);
+            next_broadcast_ms = now_ms +
+                CONTROLLER_BROADCAST_INTERVAL_MS;
+        }
         dsu_server_expire_clients(&server);
         app_platform_render_status(platform, &server, &controller);
         app_platform_sleep(platform);

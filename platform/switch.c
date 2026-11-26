@@ -18,7 +18,7 @@
 
 #define MOTION_HANDLES 4
 #define UI_REFRESH_NS 250000000ULL
-#define SEND_INTERVAL_NS 10000000ULL
+#define PLATFORM_POLL_INTERVAL_NS 1000000ULL
 #define EXIT_HOLD_US 3000000ULL
 
 struct AppPlatform {
@@ -280,5 +280,5 @@ void app_platform_render_status(AppPlatform *platform, const DsuServer *server,
 void app_platform_sleep(AppPlatform *platform)
 {
     (void)platform;
-    svcSleepThread(SEND_INTERVAL_NS);
+    svcSleepThread(PLATFORM_POLL_INTERVAL_NS);
 }
