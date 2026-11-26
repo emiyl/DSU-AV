@@ -7,8 +7,12 @@
 
 #define MAX_OPUS_SAMPLES 2880
 #define AUDIO_RING_BYTES (48000 * 2 * sizeof(int16_t))
-#define AUDIO_START_BYTES (48000 * 2 * sizeof(int16_t) / 10)
 #define AUDIO_STATS_INTERVAL_US 1000000ULL
+#ifdef __SWITCH__
+#define AUDIO_OUTPUT_SAMPLE_RATE 40960
+#else
+#define AUDIO_OUTPUT_SAMPLE_RATE 48000
+#endif
 
 struct AppAvPlayback {
     AvCodecs *codecs;
@@ -24,6 +28,8 @@ struct AppAvPlayback {
     uint32_t audio_write;
     uint32_t audio_available;
     uint32_t audio_packets_decoded;
+    uint32_t audio_output_sample_rate;
+    double audio_resample_position;
     bool audio_playing;
     uint64_t audio_packets_received;
     uint64_t audio_encoded_bytes;
@@ -77,15 +83,17 @@ static void queue_audio(AppAvPlayback *playback, const uint8_t *data,
     }
     playback->audio_available += length;
     playback->audio_bytes_buffered += length;
+    uint32_t start_bytes = playback->audio_output_sample_rate *
+        playback->settings.audio_channels * sizeof(int16_t) / 10;
     bool start = !playback->audio_playing &&
-        playback->audio_available >= AUDIO_START_BYTES;
+        playback->audio_available >= start_bytes;
     if (start)
         playback->audio_playing = true;
     SDL_UnlockAudioDevice(playback->audio_device);
     if (start) {
         SDL_PauseAudioDevice(playback->audio_device, 0);
         SDL_Log("Audio playback started after buffering %u bytes.",
-            (unsigned)AUDIO_START_BYTES);
+            (unsigned)start_bytes);
     }
 }
 
@@ -115,10 +123,14 @@ static bool session_start(void *context,
     if (settings->audio_codec != DSU_AV_CODEC_NONE &&
         !playback->video_backend.audio_start) {
         SDL_AudioSpec desired = {
-            .freq = settings->audio_sample_rate_div100 * 100,
+            .freq = AUDIO_OUTPUT_SAMPLE_RATE,
             .format = AUDIO_S16SYS,
             .channels = settings->audio_channels,
+#ifdef __SWITCH__
+            .samples = 480,
+#else
             .samples = 256,
+#endif
             .callback = render_audio,
             .userdata = playback,
         };
@@ -148,6 +160,8 @@ static bool session_start(void *context,
         playback->audio_available = 0;
         playback->audio_packets_decoded = 0;
         playback->audio_playing = false;
+        playback->audio_output_sample_rate = (uint32_t)obtained.freq;
+        playback->audio_resample_position = 0;
         playback->audio_packets_received = 0;
         playback->audio_encoded_bytes = 0;
         playback->audio_samples_decoded = 0;
@@ -238,17 +252,46 @@ static void audio_packet(void *context, uint32_t sequence,
         return;
     }
     playback->audio_samples_decoded += (uint64_t)samples;
+    int output_samples = samples;
+    int output_pcm_count = samples;
+    if (playback->audio_output_sample_rate &&
+        playback->audio_output_sample_rate !=
+            playback->settings.audio_sample_rate_div100 * 100) {
+        int input_rate =
+            playback->settings.audio_sample_rate_div100 * 100;
+        double ratio = (double)input_rate /
+            playback->audio_output_sample_rate;
+        output_samples = (int)((double)samples / ratio);
+        for (int sample = 0; sample < output_samples; ++sample) {
+            int source = (int)playback->audio_resample_position;
+            if (source >= samples)
+                source = samples - 1;
+            for (int channel = 0;
+                channel < playback->settings.audio_channels; ++channel) {
+                playback->pcm[sample *
+                    playback->settings.audio_channels + channel] =
+                    ((const int16_t *)playback->pcm)[source *
+                        playback->settings.audio_channels + channel];
+            }
+            playback->audio_resample_position += ratio;
+        }
+        playback->audio_resample_position -= samples;
+        if (playback->audio_resample_position < 0)
+            playback->audio_resample_position = 0;
+        output_pcm_count = output_samples;
+    }
     if (playback->video_backend.audio_submit) {
         if (!playback->video_backend.audio_submit(
                 playback->video_backend.context, playback->pcm,
-                (uint32_t)samples,
+                (uint32_t)output_pcm_count,
                 playback->settings.audio_channels)) {
             SDL_LogWarn(SDL_LOG_CATEGORY_AUDIO,
                 "Switch audio backend could not submit decoded PCM.");
         }
     } else {
         queue_audio(playback, (const uint8_t *)playback->pcm,
-            (uint32_t)(samples * playback->settings.audio_channels *
+            (uint32_t)(output_pcm_count *
+                playback->settings.audio_channels *
                 sizeof(int16_t)));
     }
     ++playback->audio_packets_decoded;
