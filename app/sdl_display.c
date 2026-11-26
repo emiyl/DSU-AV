@@ -86,7 +86,7 @@ SdlDisplay *sdl_display_create(void)
         return NULL;
     }
     display->renderer = SDL_CreateRenderer(display->window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+        SDL_RENDERER_ACCELERATED);
     if (!display->renderer)
         display->renderer = SDL_CreateRenderer(
             display->window, -1, SDL_RENDERER_SOFTWARE);
