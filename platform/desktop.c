@@ -134,7 +134,8 @@ AppPlatform *app_platform_create(void)
         return NULL;
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO |
             SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) < 0) {
-        SDL_Log("SDL_Init failed: %s", SDL_GetError());
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+            "SDL_Init failed: %s", SDL_GetError());
         free(platform);
         return NULL;
     }
@@ -165,9 +166,6 @@ AppPlatform *app_platform_create(void)
         },
     };
     platform->controller = open_controller();
-    SDL_Log("Controller: %s",
-        platform->controller ? SDL_GameControllerName(platform->controller) :
-            "waiting for an SDL-mapped gamepad");
     platform->running = true;
     return platform;
 }

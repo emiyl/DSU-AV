@@ -49,10 +49,6 @@ typedef struct {
     uint64_t last_video_us;
     uint64_t next_audio_us;
     bool audio_started;
-    uint64_t audio_encoded_packets;
-    uint64_t audio_sent_packets;
-    uint64_t audio_send_failures;
-    uint64_t next_audio_log_us;
     uint8_t *framebuffer;
     int16_t audio_pcm[AUDIO_SAMPLES * AUDIO_CHANNELS];
     uint8_t encoded_video[ENCODED_FRAME_CAPACITY];
@@ -338,21 +334,14 @@ static void on_media_session(void *context, bool started, uint8_t status,
     game->last_video_us = 0;
     game->next_audio_us = game->media_start_us;
     game->audio_started = false;
-    game->audio_encoded_packets = 0;
-    game->audio_sent_packets = 0;
-    game->audio_send_failures = 0;
-    game->next_audio_log_us = monotonic_us() + 1000000;
     game->force_keyframe = true;
     game->session_started = true;
-    printf("Streaming snake at %ux%u and %u FPS.\n",
-        (unsigned)settings->video_width, (unsigned)settings->video_height,
-        (unsigned)settings->video_fps);
 }
 
 static void on_media_stopped(void *context, uint8_t reason)
 {
+    (void)reason;
     SnakeGame *game = context;
-    printf("Media session stopped (reason %u).\n", (unsigned)reason);
     game->session_started = false;
     game->next_session_attempt_us = monotonic_us() + 1000000;
     av_codecs_destroy(game->codecs);
@@ -384,30 +373,13 @@ static void produce_audio(SnakeGame *game, uint64_t timestamp_us)
     }
     int length = av_codecs_encode_opus(game->codecs, game->audio_pcm,
         AUDIO_SAMPLES, game->encoded_audio, OPUS_PACKET_CAPACITY);
-    if (length <= 0) {
-        ++game->audio_send_failures;
+    if (length <= 0)
         return;
-    }
-    ++game->audio_encoded_packets;
     if (dsu_client_send_audio(&game->client,
             timestamp_us - game->media_start_us,
             game->audio_started ? 0 : 0x01,
             game->encoded_audio, (uint16_t)length)) {
         game->audio_started = true;
-        ++game->audio_sent_packets;
-    } else {
-        ++game->audio_send_failures;
-    }
-    uint64_t now = monotonic_us();
-    if (now >= game->next_audio_log_us) {
-        printf("Snake audio: encoded=%llu sent=%llu failed=%llu "
-            "last_size=%d active=%d.\n",
-            (unsigned long long)game->audio_encoded_packets,
-            (unsigned long long)game->audio_sent_packets,
-            (unsigned long long)game->audio_send_failures, length,
-            dsu_client_media_active(&game->client) ? 1 : 0);
-        fflush(stdout);
-        game->next_audio_log_us = now + 1000000;
     }
 }
 
@@ -473,8 +445,6 @@ int main(int argc, char **argv)
         return 1;
     }
     dsu_client_request_capabilities(&game.client);
-    printf("Connecting to DSU controller at %s:%u.\n",
-        server_address, (unsigned)DSU_PORT);
 
     bool running = true;
     while (running) {
