@@ -240,7 +240,13 @@ static bool av_codecs_init_h264_encoder(AvCodecs *codecs)
 {
     if (codecs->h264_encoder_context)
         return true;
+#if defined(__APPLE__)
+    const AVCodec *codec = avcodec_find_encoder_by_name("h264_videotoolbox");
+#else
     const AVCodec *codec = avcodec_find_encoder_by_name("libx264");
+#endif
+    if (!codec)
+        codec = avcodec_find_encoder_by_name("libx264");
     if (!codec)
         codec = avcodec_find_encoder(AV_CODEC_ID_H264);
     if (!codec)
@@ -261,11 +267,16 @@ static bool av_codecs_init_h264_encoder(AvCodecs *codecs)
     context->max_b_frames = 0;
     context->flags |= AV_CODEC_FLAG_LOW_DELAY;
     context->thread_count = 1;
-    av_opt_set(context->priv_data, "preset", "ultrafast", 0);
-    av_opt_set(context->priv_data, "tune", "zerolatency", 0);
-    av_opt_set(context->priv_data, "rc-lookahead", "0", 0);
-    av_opt_set_int(context->priv_data, "bframes", 0, 0);
-    av_opt_set_int(context->priv_data, "repeat-headers", 1, 0);
+    if (codec->name && strcmp(codec->name, "h264_videotoolbox") == 0) {
+        av_opt_set_int(context->priv_data, "realtime", 1, 0);
+        av_opt_set_int(context->priv_data, "allow_sw", 1, 0);
+    } else {
+        av_opt_set(context->priv_data, "preset", "ultrafast", 0);
+        av_opt_set(context->priv_data, "tune", "zerolatency", 0);
+        av_opt_set(context->priv_data, "rc-lookahead", "0", 0);
+        av_opt_set_int(context->priv_data, "bframes", 0, 0);
+        av_opt_set_int(context->priv_data, "repeat-headers", 1, 0);
+    }
     if (avcodec_open2(context, codec, NULL) < 0)
         goto fail;
 
