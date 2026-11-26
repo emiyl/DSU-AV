@@ -168,11 +168,22 @@ void sdl_display_status(SdlDisplay *display, const DsuServer *server,
 {
     if (!display)
         return;
+    const DsuAvSessionSettings *av_settings =
+        dsu_server_av_settings(server);
+    bool video_stream_present = av_settings &&
+        av_settings->video_codec != DSU_AV_CODEC_NONE;
+
     SDL_SetRenderDrawColor(display->renderer, 20, 23, 29, 255);
-    if (!display->has_video)
+    if (video_stream_present) {
         SDL_RenderClear(display->renderer);
-    else
-        SDL_RenderCopy(display->renderer, display->video_texture, NULL, NULL);
+        if (display->has_video)
+            SDL_RenderCopy(display->renderer, display->video_texture,
+                NULL, NULL);
+        SDL_RenderPresent(display->renderer);
+        return;
+    }
+
+    SDL_RenderClear(display->renderer);
 
     SDL_SetRenderDrawColor(display->renderer, 8, 10, 14, 220);
     SDL_Rect panel = {24, 24, 820, 330};
