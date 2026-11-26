@@ -33,6 +33,7 @@ void app_controller_to_dsu(const AppControllerInput *input,
     output->connected = input->connected;
     output->home_button = input->home;
     output->touch_button = input->touch;
+    memcpy(output->touch, input->touch_points, sizeof(output->touch));
     output->left_stick_x = axis_to_dsu(input->left_x);
     output->left_stick_y = axis_to_dsu(input->left_y);
     output->right_stick_x = axis_to_dsu(input->right_x);

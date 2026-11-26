@@ -28,10 +28,18 @@
 #define DSU_AV_CAP_UNAUTHENTICATED (1U << 31)
 
 typedef struct {
+    bool active;
+    uint8_t id;
+    uint16_t x;
+    uint16_t y;
+} DsuTouchPoint;
+
+typedef struct {
     bool connected;
     uint8_t button_masks[2];
     uint8_t home_button;
     uint8_t touch_button;
+    DsuTouchPoint touch[2];
     uint8_t left_stick_x;
     uint8_t left_stick_y;
     uint8_t right_stick_x;

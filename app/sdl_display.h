@@ -19,3 +19,4 @@ void sdl_display_status(SdlDisplay *display, const DsuServer *server,
 bool sdl_display_has_video(const SdlDisplay *display);
 void sdl_display_clear_video(SdlDisplay *display);
 bool sdl_display_process_events(SdlDisplay *display);
+void sdl_display_get_touch(SdlDisplay *display, DsuTouchPoint touch[2]);

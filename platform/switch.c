@@ -241,6 +241,10 @@ void app_platform_update_controller(AppPlatform *platform,
     switch_av_handle_input(platform->media, buttons_down);
     update_controller_state(controller, &platform->pad,
         platform->motion_handles, &platform->controller_buttons);
+    sdl_display_get_touch(platform->display, controller->touch_points);
+    controller->touch =
+        controller->touch_points[0].active ||
+        controller->touch_points[1].active;
 }
 
 const DsuAvCapabilities *app_platform_av_capabilities(

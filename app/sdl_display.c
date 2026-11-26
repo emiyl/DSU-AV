@@ -20,6 +20,7 @@ struct SdlDisplay {
     int video_height;
     bool has_video;
     bool running;
+    DsuTouchPoint touch[2];
 };
 
 static const uint8_t font_5x7[][7] = {
@@ -237,6 +238,31 @@ bool sdl_display_process_events(SdlDisplay *display)
     while (SDL_PollEvent(&event)) {
         if (event.type == SDL_QUIT)
             display->running = false;
+        if (event.type == SDL_FINGERDOWN || event.type == SDL_FINGERMOTION) {
+            const uint8_t id = (uint8_t)(event.tfinger.fingerId & 0xff);
+            int slot = 0;
+            while (slot < 2 && display->touch[slot].active &&
+                display->touch[slot].id != id)
+                ++slot;
+            if (slot < 2) {
+                display->touch[slot] = (DsuTouchPoint) {
+                    .active = true,
+                    .id = id,
+                    .x = (uint16_t)(event.tfinger.x * 1920),
+                    .y = (uint16_t)(event.tfinger.y * 942),
+                };
+            }
+        } else if (event.type == SDL_FINGERUP) {
+            const uint8_t id = (uint8_t)(event.tfinger.fingerId & 0xff);
+            for (unsigned i = 0; i < 2; ++i)
+                if (display->touch[i].id == id)
+                    display->touch[i].active = false;
+        }
     }
     return display->running;
+}
+
+void sdl_display_get_touch(SdlDisplay *display, DsuTouchPoint touch[2])
+{
+    memcpy(touch, display->touch, sizeof(display->touch));
 }

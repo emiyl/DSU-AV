@@ -275,6 +275,13 @@ static void handle_controller(DsuClientInternal *client,
     state.right_stick_x = payload[22];
     state.right_stick_y = payload[23];
     memcpy(state.analog_buttons, payload + 24, 12);
+    for (unsigned touch_index = 0; touch_index < 2; ++touch_index) {
+        const uint8_t *touch = payload + 36 + touch_index * 6;
+        state.touch[touch_index].active = touch[0] != 0;
+        state.touch[touch_index].id = touch[1];
+        state.touch[touch_index].x = read_u16_le(touch + 2);
+        state.touch[touch_index].y = read_u16_le(touch + 4);
+    }
     state.motion_timestamp_us = read_u64_le(payload + 48);
     state.acceleration[0] = read_float_le(payload + 56);
     state.acceleration[1] = read_float_le(payload + 60);

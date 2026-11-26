@@ -29,6 +29,7 @@ typedef struct {
     uint64_t buttons;
     bool home;
     bool touch;
+    DsuTouchPoint touch_points[2];
     int32_t left_x;
     int32_t left_y;
     int32_t right_x;

@@ -896,6 +896,14 @@ void dsu_server_broadcast(DsuServer *server, const DsuControllerState *state)
         data[22] = state->right_stick_x;
         data[23] = state->right_stick_y;
         memcpy(data + 24, state->analog_buttons, 12);
+        for (unsigned touch_index = 0; touch_index < 2; ++touch_index) {
+            const DsuTouchPoint *touch = &state->touch[touch_index];
+            uint8_t *touch_data = data + 36 + touch_index * 6;
+            touch_data[0] = touch->active ? 1 : 0;
+            touch_data[1] = touch->id;
+            write_u16_le(touch_data + 2, touch->x);
+            write_u16_le(touch_data + 4, touch->y);
+        }
         write_u64_le(data + 48, state->motion_timestamp_us);
         if (state->motion_valid) {
             write_float_le(data + 56, state->acceleration[0]);
