@@ -270,8 +270,7 @@ void app_platform_render_status(AppPlatform *platform, const DsuServer *server,
     (void)platform->frame++;
     sdl_display_status(platform->display, server, controller,
         DSU_SWITCH_PLATFORM_NAME, platform->ip_address,
-        platform->controller_buttons,
-        "HOLD A TO ENABLE OR MUTE");
+        platform->controller_buttons, "");
 }
 
 void app_platform_sleep(AppPlatform *platform)

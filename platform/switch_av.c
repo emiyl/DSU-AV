@@ -157,6 +157,8 @@ static void receive_audio(void *context, uint32_t sequence,
         data, length);
 }
 
+static bool start_microphone(SwitchAv *media);
+
 static bool session_start(void *context, const DsuAvSessionSettings *settings)
 {
     SwitchAv *media = context;
@@ -239,6 +241,8 @@ void switch_av_poll(SwitchAv *media)
     if (!media || !media->active)
         return;
     app_av_playback_poll(media->playback);
+    if (media->microphone.state == APP_MIC_AWAITING_CONSENT)
+        start_microphone(media);
     if (!media->capture_device ||
         !app_microphone_is_capturing(&media->microphone))
         return;
